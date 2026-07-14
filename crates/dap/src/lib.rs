@@ -8,6 +8,12 @@
 
 #![forbid(unsafe_code)]
 
+mod transport;
+
+pub use transport::{
+    DEFAULT_MAX_CONTENT_LENGTH, DapReadError, DapReader, DapWriteError, DapWriter,
+};
+
 /// Current internal version of the DAP implementation.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
