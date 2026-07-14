@@ -4,8 +4,7 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 use crate::{
-    GdbCommandResult, GdbEvent, GdbProcess, GdbProcessConfig, GdbProcessError, MiRecord,
-    MiResultRecord, commands,
+    GdbEvent, GdbProcess, GdbProcessConfig, GdbProcessError, MiRecord, MiResultRecord, commands,
 };
 
 /// Configuration of a remote QNX debugging session.

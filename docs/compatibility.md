@@ -25,3 +25,14 @@ processing:
 - later stream output;
 - a later `^error` record with the same token;
 - `*running` and `*stopped` asynchronous records.
+
+## QNX target selection
+
+For QNX GDB 6.8, the remote target must be passed as an unquoted MI argument:
+
+```text
+3-target-select qnx 192.168.1.28:8080
+3^connected
+```
+
+The quoted form was rejected by the tested QNX GDB build.
