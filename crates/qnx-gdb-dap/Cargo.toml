@@ -1,0 +1,18 @@
+[package]
+name = "qnx-gdb-dap"
+description = "Debug Adapter Protocol server for QNX 6.5 GDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+qnx-dap = { path = "../dap" }
+qnx-gdb-mi = { path = "../gdb-mi" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "qnx-gdb-mi"
+description = "GDB/MI client compatible with QNX 6.5 ntoarm-gdb 6.8"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

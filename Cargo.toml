@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dap",
+    "crates/gdb-mi",
+    "crates/qnx-gdb-dap",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.87"
+authors = ["Artem Paraev"]
+repository = "https://github.com/iharuspex/qnx-gdb-dap"
+
+[workspace.dependencies]
+anyhow = "1.0"
+bytes = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

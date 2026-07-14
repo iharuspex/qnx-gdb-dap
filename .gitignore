@@ -1,0 +1,13 @@
+/target
+Cargo.lock.old
+
+.idea/
+.vscode/
+.zed/
+
+*.log
+*.swp
+*.swo
+*~
+
+.DS_Store
