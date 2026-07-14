@@ -8,10 +8,16 @@
 
 #![forbid(unsafe_code)]
 
+mod protocol;
 mod transport;
 
 pub use transport::{
     DEFAULT_MAX_CONTENT_LENGTH, DapReadError, DapReader, DapWriteError, DapWriter,
+};
+
+pub use protocol::{
+    Event, EventMessageType, OutgoingMessage, Request, RequestMessageType, Response,
+    ResponseMessageType,
 };
 
 /// Current internal version of the DAP implementation.

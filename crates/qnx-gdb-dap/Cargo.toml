@@ -11,6 +11,7 @@ authors.workspace = true
 anyhow.workspace = true
 qnx-dap = { path = "../dap" }
 qnx-gdb-mi = { path = "../gdb-mi" }
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
