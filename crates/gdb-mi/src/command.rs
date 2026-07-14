@@ -197,7 +197,7 @@ pub mod commands {
         MiCommand::new("target-select")
             .with_token(token)
             .raw_argument("qnx")
-            .string_argument(target)
+            .raw_argument(target)
     }
 
     /// Creates `-break-insert LOCATION`.
@@ -389,7 +389,7 @@ mod tests {
 
         assert_eq!(
             command.encode().expect("command should encode"),
-            r#"2-target-select qnx "192.168.1.20:8000""#
+            r#"2-target-select qnx 192.168.1.20:8000"#
         );
     }
 

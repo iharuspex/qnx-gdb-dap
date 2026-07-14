@@ -15,6 +15,7 @@ mod command;
 mod parser;
 mod process;
 mod record;
+mod session;
 mod value;
 
 pub use command::{MiCommand, MiTokenGenerator, commands};
@@ -23,6 +24,9 @@ pub use process::{
     GdbCommandResult, GdbEvent, GdbProcess, GdbProcessConfig, GdbProcessError, is_gdb_file,
 };
 pub use record::{MiAsyncRecord, MiRecord, MiResultRecord};
+pub use session::{
+    GdbSession, GdbSessionConfig, GdbSessionError, GdbSessionOutput, GdbSessionState,
+};
 pub use value::{MiListItem, MiResult, MiValue, find_result};
 
 #[cfg(test)]
