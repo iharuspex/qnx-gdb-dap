@@ -11,10 +11,12 @@
 /// GDB version against which the initial implementation is developed.
 pub const REFERENCE_GDB_VERSION: &str = "GNU gdb 6.8 qnx-nto (rev. 506)";
 
+mod command;
 mod parser;
 mod record;
 mod value;
 
+pub use command::{MiCommand, MiTokenGenerator, commands};
 pub use parser::{MiParseError, parse_record};
 pub use record::{MiAsyncRecord, MiRecord, MiResultRecord};
 pub use value::{MiListItem, MiResult, MiValue};
