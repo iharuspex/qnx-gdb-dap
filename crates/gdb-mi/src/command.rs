@@ -389,7 +389,7 @@ mod tests {
 
         assert_eq!(
             command.encode().expect("command should encode"),
-            r#"2-target-select qnx 192.168.1.20:8000"#
+            r"2-target-select qnx 192.168.1.20:8000"
         );
     }
 

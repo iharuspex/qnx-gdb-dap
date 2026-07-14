@@ -110,6 +110,7 @@ dependencies = [
  "anyhow",
  "qnx-dap",
  "qnx-gdb-mi",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",

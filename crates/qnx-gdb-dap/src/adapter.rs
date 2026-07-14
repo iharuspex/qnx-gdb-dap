@@ -1,7 +1,9 @@
 use std::io::{BufRead, Write};
 
+use crate::LaunchArguments;
 use anyhow::Result;
 use qnx_dap::{DapReader, DapWriter, Event, OutgoingMessage, Request, Response};
+use qnx_gdb_mi::{GdbEvent, GdbSession, GdbSessionConfig, GdbSessionOutput, MiRecord};
 use serde_json::json;
 use tracing::{debug, info, warn};
 
@@ -14,6 +16,12 @@ pub enum AdapterState {
     /// The DAP client has successfully initialized the adapter.
     Initialized,
 
+    /// A launch request is currently being processed.
+    Launching,
+
+    /// GDB is connected to the remote QNX target.
+    Connected,
+
     /// The DAP input stream has been closed.
     Disconnected,
 }
@@ -23,6 +31,7 @@ pub enum AdapterState {
 pub struct DebugAdapter {
     sequence: SequenceGenerator,
     state: AdapterState,
+    session: Option<GdbSession>,
 }
 
 impl DebugAdapter {
@@ -32,6 +41,7 @@ impl DebugAdapter {
         Self {
             sequence: SequenceGenerator::new(),
             state: AdapterState::Created,
+            session: None,
         }
     }
 
@@ -63,6 +73,13 @@ impl DebugAdapter {
             self.handle_request(&request, writer)?;
         }
 
+        if let Some(session) = self.session.as_mut()
+            && let Err(error) = session.shutdown()
+        {
+            warn!(%error, "failed to shut down GDB session");
+        }
+
+        self.session = None;
         self.state = AdapterState::Disconnected;
         info!("DAP input stream closed");
 
@@ -75,6 +92,7 @@ impl DebugAdapter {
     {
         match request.command.as_str() {
             "initialize" => self.handle_initialize(request, writer),
+            "launch" => self.handle_launch(request, writer),
             command => {
                 warn!(
                     command = %command,
@@ -125,6 +143,97 @@ impl DebugAdapter {
         writer.write_message(&OutgoingMessage::Event(initialized))?;
 
         Ok(())
+    }
+
+    fn handle_launch<W>(&mut self, request: &Request, writer: &mut DapWriter<W>) -> Result<()>
+    where
+        W: Write,
+    {
+        if self.state != AdapterState::Initialized {
+            return self.send_error_response(
+                request,
+                writer,
+                format!(
+                    "launch is not valid while adapter is in state {:?}",
+                    self.state
+                ),
+            );
+        }
+
+        let Some(arguments) = request.arguments.clone() else {
+            return self.send_error_response(
+                request,
+                writer,
+                "launch request does not contain arguments",
+            );
+        };
+
+        let launch_arguments = match serde_json::from_value::<LaunchArguments>(arguments) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                return self.send_error_response(
+                    request,
+                    writer,
+                    format!("invalid launch arguments: {error}"),
+                );
+            }
+        };
+
+        self.state = AdapterState::Launching;
+
+        match self.create_session(launch_arguments) {
+            Ok((session, output)) => {
+                self.log_session_output(&output);
+                self.session = Some(session);
+                self.state = AdapterState::Connected;
+
+                self.send_success_response(request, writer, None)
+            }
+
+            Err(error) => {
+                self.state = AdapterState::Initialized;
+
+                self.send_error_response(
+                    request,
+                    writer,
+                    format!("failed to launch QNX debug session: {error:#}"),
+                )
+            }
+        }
+    }
+
+    fn create_session(&self, arguments: LaunchArguments) -> Result<(GdbSession, GdbSessionOutput)> {
+        let mut config = GdbSessionConfig::new(arguments.gdb, arguments.program, arguments.target);
+
+        if let Some(working_directory) = arguments.working_directory {
+            config = config.working_directory(working_directory);
+        }
+
+        for argument in arguments.gdb_arguments {
+            config = config.gdb_argument(argument);
+        }
+
+        let session = GdbSession::connect(config)?;
+
+        Ok(session)
+    }
+
+    fn log_session_output(&self, output: &GdbSessionOutput) {
+        for record in &output.startup_records {
+            log_mi_record("startup", record);
+        }
+
+        for event in &output.version_events {
+            log_gdb_event("version", event);
+        }
+
+        for event in &output.symbol_events {
+            log_gdb_event("symbols", event);
+        }
+
+        for event in &output.target_events {
+            log_gdb_event("target", event);
+        }
     }
 
     fn send_success_response<W>(
@@ -183,6 +292,46 @@ impl SequenceGenerator {
             .expect("DAP sequence number overflow");
 
         current
+    }
+}
+
+fn log_gdb_event(context: &str, event: &GdbEvent) {
+    match event {
+        GdbEvent::Async(record) | GdbEvent::Stream(record) => {
+            log_mi_record(context, record);
+        }
+    }
+}
+
+fn log_mi_record(context: &str, record: &MiRecord) {
+    match record {
+        MiRecord::ConsoleStream(text) => {
+            debug!(
+                %context,
+                output = %text.trim_end(),
+                "GDB console output"
+            );
+        }
+
+        MiRecord::TargetStream(text) => {
+            debug!(
+                %context,
+                output = %text.trim_end(),
+                "QNX target output"
+            );
+        }
+
+        MiRecord::LogStream(text) => {
+            debug!(
+                %context,
+                output = %text.trim_end(),
+                "GDB diagnostic output"
+            );
+        }
+
+        other => {
+            debug!(%context, record = ?other, "GDB MI record");
+        }
     }
 }
 
@@ -341,6 +490,100 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(sequences, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn rejects_launch_before_initialize() {
+        let input = encode_messages(&[json!({
+            "seq": 1,
+            "type": "request",
+            "command": "launch",
+            "arguments": {
+                "gdb": "/does/not/matter",
+                "program": "/does/not/matter",
+                "target": "localhost:8000"
+            }
+        })]);
+
+        let (_, messages) = run_adapter(input);
+
+        assert_eq!(
+            messages,
+            vec![json!({
+                "seq": 1,
+                "type": "response",
+                "request_seq": 1,
+                "success": false,
+                "command": "launch",
+                "message": "launch is not valid while adapter is in state Created"
+            })]
+        );
+    }
+
+    #[test]
+    fn rejects_launch_without_arguments() {
+        let input = encode_messages(&[
+            json!({
+                "seq": 1,
+                "type": "request",
+                "command": "initialize"
+            }),
+            json!({
+                "seq": 2,
+                "type": "request",
+                "command": "launch"
+            }),
+        ]);
+
+        let (_, messages) = run_adapter(input);
+
+        assert_eq!(messages.len(), 3);
+
+        assert_eq!(
+            messages[2],
+            json!({
+                "seq": 3,
+                "type": "response",
+                "request_seq": 2,
+                "success": false,
+                "command": "launch",
+                "message": "launch request does not contain arguments"
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_launch_arguments() {
+        let input = encode_messages(&[
+            json!({
+                "seq": 1,
+                "type": "request",
+                "command": "initialize"
+            }),
+            json!({
+                "seq": 2,
+                "type": "request",
+                "command": "launch",
+                "arguments": {
+                    "gdb": "/usr/bin/ntoarm-gdb"
+                }
+            }),
+        ]);
+
+        let (_, messages) = run_adapter(input);
+
+        assert_eq!(messages.len(), 3);
+
+        assert_eq!(messages[2]["type"], "response");
+        assert_eq!(messages[2]["request_seq"], 2);
+        assert_eq!(messages[2]["success"], false);
+        assert_eq!(messages[2]["command"], "launch");
+
+        let message = messages[2]["message"]
+            .as_str()
+            .expect("error response should contain a message");
+
+        assert!(message.starts_with("invalid launch arguments:"));
     }
 
     fn run_adapter(input: Vec<u8>) -> (DebugAdapter, Vec<Value>) {
