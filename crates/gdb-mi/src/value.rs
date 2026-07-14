@@ -40,6 +40,14 @@ impl MiValue {
             Self::Const(_) | Self::Tuple(_) => None,
         }
     }
+
+    #[must_use]
+    pub fn tuple_result(&self, variable: &str) -> Option<&MiValue> {
+        self.as_tuple()?
+            .iter()
+            .find(|result| result.variable == variable)
+            .map(|result| &result.value)
+    }
 }
 
 /// A named result in a GDB/MI record.
@@ -71,6 +79,15 @@ pub enum MiListItem {
 
     /// A named result.
     Result(MiResult),
+}
+
+/// Finds a named value in a result collection.
+#[must_use]
+pub fn find_result<'a>(results: &'a [MiResult], variable: &str) -> Option<&'a MiValue> {
+    results
+        .iter()
+        .find(|result| result.variable == variable)
+        .map(|result| &result.value)
 }
 
 impl fmt::Display for MiValue {

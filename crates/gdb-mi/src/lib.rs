@@ -13,13 +13,17 @@ pub const REFERENCE_GDB_VERSION: &str = "GNU gdb 6.8 qnx-nto (rev. 506)";
 
 mod command;
 mod parser;
+mod process;
 mod record;
 mod value;
 
 pub use command::{MiCommand, MiTokenGenerator, commands};
 pub use parser::{MiParseError, parse_record};
+pub use process::{
+    GdbCommandResult, GdbEvent, GdbProcess, GdbProcessConfig, GdbProcessError, is_gdb_file,
+};
 pub use record::{MiAsyncRecord, MiRecord, MiResultRecord};
-pub use value::{MiListItem, MiResult, MiValue};
+pub use value::{MiListItem, MiResult, MiValue, find_result};
 
 #[cfg(test)]
 mod tests {

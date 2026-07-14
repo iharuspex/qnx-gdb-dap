@@ -8,10 +8,13 @@ rust-version.workspace = true
 authors.workspace = true
 
 [dependencies]
-anyhow.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
 
 [lints]
 workspace = true
