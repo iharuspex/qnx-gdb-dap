@@ -11,6 +11,7 @@
 /// GDB version against which the initial implementation is developed.
 pub const REFERENCE_GDB_VERSION: &str = "GNU gdb 6.8 qnx-nto (rev. 506)";
 
+mod breakpoint;
 mod command;
 mod parser;
 mod process;
@@ -18,6 +19,7 @@ mod record;
 mod session;
 mod value;
 
+pub use breakpoint::{GdbBreakpoint, SourceBreakpoint};
 pub use command::{MiCommand, MiTokenGenerator, commands};
 pub use parser::{MiParseError, parse_record};
 pub use process::{

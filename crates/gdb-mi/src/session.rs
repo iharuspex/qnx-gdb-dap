@@ -1,10 +1,14 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use thiserror::Error;
 use tracing::{debug, info};
 
 use crate::{
-    GdbEvent, GdbProcess, GdbProcessConfig, GdbProcessError, MiRecord, MiResultRecord, commands,
+    GdbBreakpoint, GdbEvent, GdbProcess, GdbProcessConfig, GdbProcessError, MiRecord,
+    MiResultRecord, SourceBreakpoint, commands, find_result,
 };
 
 /// Configuration of a remote QNX debugging session.
@@ -99,6 +103,9 @@ pub struct GdbSession {
     process: GdbProcess,
     config: GdbSessionConfig,
     state: GdbSessionState,
+
+    /// GDB breakpoint numbers grouped by requested source file.
+    source_breakpoints: HashMap<PathBuf, Vec<u64>>,
 }
 
 impl GdbSession {
@@ -133,6 +140,7 @@ impl GdbSession {
             process,
             config,
             state: GdbSessionState::Ready,
+            source_breakpoints: HashMap::new(),
         };
 
         debug!("checking GDB version");
@@ -209,6 +217,118 @@ impl GdbSession {
     #[must_use]
     pub fn gdb_process_id(&self) -> u32 {
         self.process.id()
+    }
+
+    /// Replaces all source breakpoints for one source file.
+    ///
+    /// Existing breakpoints previously installed through this session for the
+    /// specified source file are removed before new breakpoints are created.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    ///
+    /// - the session is not connected;
+    /// - the source path is not valid UTF-8;
+    /// - old breakpoints cannot be removed;
+    /// - communication with GDB fails.
+    ///
+    /// An individual `-break-insert` failure is returned as an unverified
+    /// breakpoint and does not abort processing of the remaining lines.
+    pub fn set_source_breakpoints(
+        &mut self,
+        source: &Path,
+        breakpoints: &[SourceBreakpoint],
+    ) -> Result<Vec<GdbBreakpoint>, GdbSessionError> {
+        self.require_state("set source breakpoints", &[GdbSessionState::Connected])?;
+
+        let source_text = path_to_utf8(source, "breakpoint source file")?;
+
+        self.remove_source_breakpoints(source)?;
+
+        let mut results = Vec::with_capacity(breakpoints.len());
+        let mut installed_numbers = Vec::new();
+
+        for breakpoint in breakpoints {
+            let location = format!("{source_text}:{}", breakpoint.line);
+
+            debug!(
+                source = %source.display(),
+                line = breakpoint.line,
+                %location,
+                "inserting source breakpoint"
+            );
+
+            let command_result = self
+                .process
+                .execute(|token| commands::break_insert(token, &location))?;
+
+            match parse_breakpoint_result(source, breakpoint.line, &command_result.result) {
+                Ok(parsed) => {
+                    if let Some(number) = parsed.number {
+                        installed_numbers.push(number);
+                    }
+
+                    results.push(parsed);
+                }
+
+                Err(GdbSessionError::GdbCommand { message, .. }) => {
+                    results.push(GdbBreakpoint::unverified(source, breakpoint.line, message));
+                }
+
+                Err(error) => return Err(error),
+            }
+        }
+
+        if !installed_numbers.is_empty() {
+            self.source_breakpoints
+                .insert(source.to_path_buf(), installed_numbers);
+        }
+
+        Ok(results)
+    }
+
+    fn remove_source_breakpoints(&mut self, source: &Path) -> Result<(), GdbSessionError> {
+        let Some(numbers) = self.source_breakpoints.get(source).cloned() else {
+            return Ok(());
+        };
+
+        if numbers.is_empty() {
+            self.source_breakpoints.remove(source);
+            return Ok(());
+        }
+
+        debug!(
+            source = %source.display(),
+            breakpoint_numbers = ?numbers,
+            "removing previous source breakpoints"
+        );
+
+        let result = self
+            .process
+            .execute(|token| commands::break_delete(token, &numbers))?;
+
+        require_result_class("break-delete", &result.result, &["done"])?;
+
+        self.source_breakpoints.remove(source);
+
+        Ok(())
+    }
+
+    fn require_state(
+        &self,
+        operation: &'static str,
+        accepted_states: &[GdbSessionState],
+    ) -> Result<(), GdbSessionError> {
+        if accepted_states.contains(&self.state) {
+            return Ok(());
+        }
+
+        Err(GdbSessionError::InvalidSessionState {
+            operation,
+            actual: self.state,
+            expected: accepted_states.to_vec(),
+        })
     }
 
     /// Returns mutable access to the low-level GDB process.
@@ -312,6 +432,62 @@ fn require_result_class(
     })
 }
 
+fn parse_breakpoint_result(
+    requested_source: &Path,
+    requested_line: u64,
+    result: &MiResultRecord,
+) -> Result<GdbBreakpoint, GdbSessionError> {
+    require_result_class("break-insert", result, &["done"])?;
+
+    let breakpoint =
+        find_result(&result.results, "bkpt").ok_or(GdbSessionError::MissingBreakpointData)?;
+
+    let tuple = breakpoint
+        .as_tuple()
+        .ok_or(GdbSessionError::InvalidBreakpointData)?;
+
+    let number = find_tuple_const(tuple, "number").and_then(|value| value.parse::<u64>().ok());
+
+    let resolved_line = find_tuple_const(tuple, "line")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(requested_line);
+
+    let resolved_file = find_tuple_const(tuple, "fullname")
+        .or_else(|| find_tuple_const(tuple, "file"))
+        .map(PathBuf::from);
+
+    let function = find_tuple_const(tuple, "func").map(ToOwned::to_owned);
+
+    let address = find_tuple_const(tuple, "addr").map(ToOwned::to_owned);
+
+    let pending = find_tuple_const(tuple, "pending");
+
+    let verified = number.is_some() && pending.is_none();
+
+    let message = if verified {
+        None
+    } else if let Some(pending_location) = pending {
+        Some(format!("breakpoint is pending at {pending_location}"))
+    } else {
+        Some("GDB did not return a breakpoint number".to_owned())
+    };
+
+    Ok(GdbBreakpoint {
+        number,
+        source: requested_source.to_path_buf(),
+        line: resolved_line,
+        verified,
+        function,
+        resolved_file,
+        address,
+        message,
+    })
+}
+
+fn find_tuple_const<'a>(results: &'a [crate::MiResult], name: &str) -> Option<&'a str> {
+    find_result(results, name)?.as_const()
+}
+
 /// Error produced while configuring or managing a GDB session.
 #[derive(Debug, Error)]
 pub enum GdbSessionError {
@@ -356,19 +532,37 @@ pub enum GdbSessionError {
 
     #[error("GDB process error")]
     Process(#[from] GdbProcessError),
+
+    #[error("GDB did not return breakpoint data")]
+    MissingBreakpointData,
+
+    #[error("GDB returned malformed breakpoint data")]
+    InvalidBreakpointData,
+
+    #[error(
+        "operation {operation:?} is not valid while GDB session is in state {actual:?}; expected one of {expected:?}"
+    )]
+    InvalidSessionState {
+        operation: &'static str,
+        actual: GdbSessionState,
+        expected: Vec<GdbSessionState>,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
         fs::{self, File},
-        path::PathBuf,
+        path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use crate::{MiResult, MiResultRecord, MiValue};
 
-    use super::{GdbSessionConfig, GdbSessionError, require_result_class, validate_config};
+    use super::{
+        GdbSessionConfig, GdbSessionError, parse_breakpoint_result, require_result_class,
+        validate_config,
+    };
 
     #[test]
     fn rejects_empty_target() {
@@ -440,6 +634,115 @@ mod tests {
                 message,
             } if message == "Connection refused."
         ));
+    }
+
+    #[test]
+    fn parses_inserted_breakpoint() {
+        let result = MiResultRecord {
+            token: Some(4),
+            class: "done".to_owned(),
+            results: vec![MiResult::new(
+                "bkpt",
+                MiValue::Tuple(vec![
+                    MiResult::new("number", MiValue::Const("3".to_owned())),
+                    MiResult::new("type", MiValue::Const("breakpoint".to_owned())),
+                    MiResult::new("disp", MiValue::Const("keep".to_owned())),
+                    MiResult::new("enabled", MiValue::Const("y".to_owned())),
+                    MiResult::new("addr", MiValue::Const("0x00012340".to_owned())),
+                    MiResult::new("func", MiValue::Const("main".to_owned())),
+                    MiResult::new("file", MiValue::Const("main.cpp".to_owned())),
+                    MiResult::new(
+                        "fullname",
+                        MiValue::Const("/home/user/project/main.cpp".to_owned()),
+                    ),
+                    MiResult::new("line", MiValue::Const("42".to_owned())),
+                ]),
+            )],
+        };
+
+        let breakpoint =
+            parse_breakpoint_result(Path::new("/home/user/project/main.cpp"), 42, &result)
+                .expect("breakpoint should parse");
+
+        assert_eq!(breakpoint.number, Some(3));
+        assert_eq!(breakpoint.line, 42);
+        assert!(breakpoint.verified);
+        assert_eq!(breakpoint.function.as_deref(), Some("main"));
+        assert_eq!(
+            breakpoint.resolved_file,
+            Some(PathBuf::from("/home/user/project/main.cpp"))
+        );
+        assert_eq!(breakpoint.address.as_deref(), Some("0x00012340"));
+        assert_eq!(breakpoint.message, None);
+    }
+
+    #[test]
+    fn parses_pending_breakpoint() {
+        let result = MiResultRecord {
+            token: Some(4),
+            class: "done".to_owned(),
+            results: vec![MiResult::new(
+                "bkpt",
+                MiValue::Tuple(vec![
+                    MiResult::new("number", MiValue::Const("5".to_owned())),
+                    MiResult::new(
+                        "pending",
+                        MiValue::Const("/home/user/project/main.cpp:100".to_owned()),
+                    ),
+                ]),
+            )],
+        };
+
+        let breakpoint =
+            parse_breakpoint_result(Path::new("/home/user/project/main.cpp"), 100, &result)
+                .expect("pending breakpoint should parse");
+
+        assert_eq!(breakpoint.number, Some(5));
+        assert!(!breakpoint.verified);
+        assert_eq!(
+            breakpoint.message.as_deref(),
+            Some(
+                "breakpoint is pending at \
+                 /home/user/project/main.cpp:100"
+            )
+        );
+    }
+
+    #[test]
+    fn reports_breakpoint_insert_error() {
+        let result = MiResultRecord {
+            token: Some(4),
+            class: "error".to_owned(),
+            results: vec![MiResult::new(
+                "msg",
+                MiValue::Const("No source file named missing.cpp.".to_owned()),
+            )],
+        };
+
+        let error = parse_breakpoint_result(Path::new("missing.cpp"), 42, &result)
+            .expect_err("GDB error should be returned");
+
+        assert!(matches!(
+            error,
+            GdbSessionError::GdbCommand {
+                operation: "break-insert",
+                message,
+            } if message == "No source file named missing.cpp."
+        ));
+    }
+
+    #[test]
+    fn rejects_breakpoint_result_without_bkpt() {
+        let result = MiResultRecord {
+            token: Some(4),
+            class: "done".to_owned(),
+            results: Vec::new(),
+        };
+
+        let error = parse_breakpoint_result(Path::new("main.cpp"), 42, &result)
+            .expect_err("missing bkpt data should fail");
+
+        assert!(matches!(error, GdbSessionError::MissingBreakpointData));
     }
 
     struct TemporaryFiles {
