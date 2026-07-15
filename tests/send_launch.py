@@ -69,14 +69,55 @@ requests = [
                 "ntoarm-gdb"
             ),
             "program": (
-                "/home/haruspex/projects/qnx/sigma/software/"
-                "fadapt-mavlink/build/fadapt-mavlink"
+                "/home/haruspex/ide-4.7-workspace/"
+                "test_qnx_c/arm/o-le-v7-g/test_qnx_c_g"
             ),
             "target": "192.168.1.28:8080",
         },
     },
     {
         "seq": 3,
+        "type": "request",
+        "command": "setBreakpoints",
+        "arguments": {
+            "source": {
+                "name": "test_qnx_c.c",
+                "path": (
+                    "/home/haruspex/ide-4.7-workspace/"
+                    "test_qnx_c/test_qnx_c.c"
+                ),
+            },
+            "breakpoints": [
+                {
+                    "line": 7,
+                },
+                {
+                    "line": 10,
+                },
+            ],
+            "sourceModified": False,
+        },
+    },
+    {
+        "seq": 4,
+        "type": "request",
+        "command": "setBreakpoints",
+        "arguments": {
+            "source": {
+                "path": (
+                    "/home/haruspex/ide-4.7-workspace/"
+                    "test_qnx_c/test_qnx_c.c"
+                ),
+            },
+            "breakpoints": [
+                {
+                    "line": 10,
+                },
+            ],
+        },
+    },
+    {
+        "seq": 5,
         "type": "request",
         "command": "disconnect",
         "arguments": {

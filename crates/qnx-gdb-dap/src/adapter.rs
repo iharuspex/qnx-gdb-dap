@@ -1,9 +1,11 @@
 use std::io::{BufRead, Write};
 
-use crate::{DisconnectArguments, LaunchArguments};
+use crate::{DapBreakpoint, DisconnectArguments, LaunchArguments, SetBreakpointsArguments};
 use anyhow::Result;
 use qnx_dap::{DapReader, DapWriter, Event, OutgoingMessage, Request, Response};
-use qnx_gdb_mi::{GdbEvent, GdbSession, GdbSessionConfig, GdbSessionOutput, MiRecord};
+use qnx_gdb_mi::{
+    GdbEvent, GdbSession, GdbSessionConfig, GdbSessionOutput, MiRecord, SourceBreakpoint,
+};
 use serde_json::json;
 use tracing::{debug, info, warn};
 
@@ -96,6 +98,7 @@ impl DebugAdapter {
         match request.command.as_str() {
             "initialize" => self.handle_initialize(request, writer),
             "launch" => self.handle_launch(request, writer),
+            "setBreakpoints" => self.handle_set_breakpoints(request, writer),
             "disconnect" => self.handle_disconnect(request, writer),
             command => {
                 warn!(
@@ -206,6 +209,160 @@ impl DebugAdapter {
                 )
             }
         }
+    }
+
+    fn handle_set_breakpoints<W>(
+        &mut self,
+        request: &Request,
+        writer: &mut DapWriter<W>,
+    ) -> Result<()>
+    where
+        W: Write,
+    {
+        if self.state != AdapterState::Connected {
+            return self.send_error_response(
+                request,
+                writer,
+                format!(
+                    "setBreakpoints is not valid while adapter is in state {:?}",
+                    self.state
+                ),
+            );
+        }
+
+        let Some(arguments) = request.arguments.clone() else {
+            return self.send_error_response(
+                request,
+                writer,
+                "setBreakpoints request does not contain arguments",
+            );
+        };
+
+        let arguments = match serde_json::from_value::<SetBreakpointsArguments>(arguments) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                return self.send_error_response(
+                    request,
+                    writer,
+                    format!("invalid setBreakpoints arguments: {error}"),
+                );
+            }
+        };
+
+        if arguments.source_modified {
+            debug!(
+                "sourceModified was set, but source reloading is not \
+                 required by the current GDB backend"
+            );
+        }
+
+        let Some(source_path) = arguments.source.path else {
+            return self.send_error_response(
+                request,
+                writer,
+                "setBreakpoints source does not contain a path",
+            );
+        };
+
+        for breakpoint in &arguments.breakpoints {
+            if breakpoint.line == 0 {
+                return self.send_error_response(
+                    request,
+                    writer,
+                    "breakpoint line must be greater than zero",
+                );
+            }
+
+            if breakpoint.condition.is_some() {
+                return self.send_error_response(
+                    request,
+                    writer,
+                    "conditional breakpoints are not supported",
+                );
+            }
+
+            if breakpoint.hit_condition.is_some() {
+                return self.send_error_response(
+                    request,
+                    writer,
+                    "hit conditional breakpoints are not supported",
+                );
+            }
+
+            if breakpoint.log_message.is_some() {
+                return self.send_error_response(request, writer, "log points are not supported");
+            }
+        }
+
+        let requested_breakpoints = arguments
+            .breakpoints
+            .iter()
+            .map(|breakpoint| SourceBreakpoint::new(breakpoint.line))
+            .collect::<Vec<_>>();
+
+        let breakpoint_result = {
+            let Some(session) = self.session.as_mut() else {
+                return self.send_error_response(request, writer, "GDB session is not available");
+            };
+
+            session.set_source_breakpoints(&source_path, &requested_breakpoints)
+        };
+
+        // if arguments
+        //     .breakpoints
+        //     .iter()
+        //     .any(|breakpoint| breakpoints.column.is_some())
+        // {
+        //     debug!(
+        //         "breakpoint columns were provided but are ignored by \
+        //         the current GDB backend"
+        //     );
+        // }
+
+        match breakpoint_result {
+            Ok(breakpoints) => {
+                let breakpoints = breakpoints
+                    .into_iter()
+                    .map(DapBreakpoint::from)
+                    .collect::<Vec<_>>();
+                let body = serde_json::json!({
+                    "breakpoints": breakpoints
+                });
+
+                self.send_success_response(request, writer, Some(body))
+            }
+
+            Err(error) => self.send_error_response(
+                request,
+                writer,
+                format!("failed to set source breakpoints: {error}"),
+            ),
+        }
+
+        // let Some(session) = self.session.as_mut() else {
+        //     return self.send_error_response(request, writer, "GDB session is not available");
+        // };
+
+        // match session.set_source_breakpoints(&source_path, &requested_breakpoints) {
+        //     Ok(breakpoints) => {
+        //         let breakpoints = breakpoints
+        //             .into_iter()
+        //             .map(DapBreakpoint::from)
+        //             .collect::<Vec<_>>();
+
+        //         let body = serde_json::json!({
+        //             "breakpoints": breakpoints
+        //         });
+
+        //         self.send_success_response(request, writer, Some(body))
+        //     }
+
+        //     Err(error) => self.send_error_response(
+        //         request,
+        //         writer,
+        //         format!("failed to set source breakpoints: {error}"),
+        //     ),
+        // }
     }
 
     fn handle_disconnect<W>(&mut self, request: &Request, writer: &mut DapWriter<W>) -> Result<()>
@@ -662,6 +819,156 @@ mod tests {
     }
 
     #[test]
+    fn rejects_set_breakpoints_before_launch() {
+        let input = encode_messages(&[
+            json!({
+                "seq": 1,
+                "type": "request",
+                "command": "initialize"
+            }),
+            json!({
+                "seq": 2,
+                "type": "request",
+                "command": "setBreakpoints",
+                "arguments": {
+                    "source": {
+                        "path": "/project/main.c"
+                    },
+                    "breakpoints": [
+                        {
+                            "line": 7
+                        }
+                    ]
+                }
+            }),
+        ]);
+
+        let (_, messages) = run_adapter(input);
+
+        assert_eq!(messages.len(), 3);
+
+        assert_eq!(
+            messages[2],
+            json!({
+                "seq": 3,
+                "type": "response",
+                "request_seq": 2,
+                "success": false,
+                "command": "setBreakpoints",
+                "message": "setBreakpoints is not valid while adapter is in state Initialized"
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_set_breakpoints_without_arguments() {
+        let mut adapter = DebugAdapter::new();
+        adapter.state = AdapterState::Connected;
+
+        let input = encode_messages(&[json!({
+            "seq": 1,
+            "type": "request",
+            "command": "setBreakpoints"
+        })]);
+
+        let cursor = Cursor::new(input);
+        let mut reader = DapReader::new(BufReader::new(cursor));
+        let mut writer = DapWriter::new(Vec::new());
+
+        adapter
+            .run(&mut reader, &mut writer)
+            .expect("adapter should process request");
+
+        let messages = decode_messages(writer.into_inner());
+
+        assert_eq!(
+            messages[0],
+            json!({
+                "seq": 1,
+                "type": "response",
+                "request_seq": 1,
+                "success": false,
+                "command": "setBreakpoints",
+                "message": "setBreakpoints request does not contain arguments"
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_set_breakpoints_without_source_path() {
+        let mut adapter = DebugAdapter::new();
+        adapter.state = AdapterState::Connected;
+
+        let input = encode_messages(&[json!({
+            "seq": 1,
+            "type": "request",
+            "command": "setBreakpoints",
+            "arguments": {
+                "source": {
+                    "name": "main.c"
+                },
+                "breakpoints": [
+                    {
+                        "line": 7
+                    }
+                ]
+            }
+        })]);
+
+        let cursor = Cursor::new(input);
+        let mut reader = DapReader::new(BufReader::new(cursor));
+        let mut writer = DapWriter::new(Vec::new());
+
+        adapter
+            .run(&mut reader, &mut writer)
+            .expect("adapter should process request");
+
+        let messages = decode_messages(writer.into_inner());
+
+        assert_eq!(
+            messages[0]["message"],
+            "setBreakpoints source does not contain a path"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_breakpoint_line() {
+        let mut adapter = DebugAdapter::new();
+        adapter.state = AdapterState::Connected;
+
+        let input = encode_messages(&[json!({
+            "seq": 1,
+            "type": "request",
+            "command": "setBreakpoints",
+            "arguments": {
+                "source": {
+                    "path": "/project/main.c"
+                },
+                "breakpoints": [
+                    {
+                        "line": 0
+                    }
+                ]
+            }
+        })]);
+
+        let cursor = Cursor::new(input);
+        let mut reader = DapReader::new(BufReader::new(cursor));
+        let mut writer = DapWriter::new(Vec::new());
+
+        adapter
+            .run(&mut reader, &mut writer)
+            .expect("adapter should process request");
+
+        let messages = decode_messages(writer.into_inner());
+
+        assert_eq!(
+            messages[0]["message"],
+            "breakpoint line must be greater than zero"
+        );
+    }
+
+    #[test]
     fn disconnects_after_initialize() {
         let input = encode_messages(&[
             json!({
@@ -818,17 +1125,22 @@ mod tests {
     }
 
     fn run_adapter(input: Vec<u8>) -> (DebugAdapter, Vec<Value>) {
+        run_adapter_instance(DebugAdapter::new(), input)
+    }
+
+    fn run_adapter_instance(
+        mut adapter: DebugAdapter,
+        input: Vec<u8>,
+    ) -> (DebugAdapter, Vec<Value>) {
         let cursor = Cursor::new(input);
         let mut reader = DapReader::new(BufReader::new(cursor));
         let mut writer = DapWriter::new(Vec::new());
-        let mut adapter = DebugAdapter::new();
 
         adapter
             .run(&mut reader, &mut writer)
             .expect("adapter should process valid input");
 
-        let output = writer.into_inner();
-        let messages = decode_messages(output);
+        let messages = decode_messages(writer.into_inner());
 
         (adapter, messages)
     }
