@@ -1,6 +1,6 @@
 use std::io::{BufRead, Write};
 
-use crate::LaunchArguments;
+use crate::{DisconnectArguments, LaunchArguments};
 use anyhow::Result;
 use qnx_dap::{DapReader, DapWriter, Event, OutgoingMessage, Request, Response};
 use qnx_gdb_mi::{GdbEvent, GdbSession, GdbSessionConfig, GdbSessionOutput, MiRecord};
@@ -21,6 +21,9 @@ pub enum AdapterState {
 
     /// GDB is connected to the remote QNX target.
     Connected,
+
+    /// The debug session has been explicitly terminated.
+    Terminated,
 
     /// The DAP input stream has been closed.
     Disconnected,
@@ -93,6 +96,7 @@ impl DebugAdapter {
         match request.command.as_str() {
             "initialize" => self.handle_initialize(request, writer),
             "launch" => self.handle_launch(request, writer),
+            "disconnect" => self.handle_disconnect(request, writer),
             command => {
                 warn!(
                     command = %command,
@@ -132,7 +136,9 @@ impl DebugAdapter {
             "supportsStepBack": false,
             "supportsSetVariable": false,
             "supportsReadMemoryRequest": false,
-            "supportsDisassembleRequest": false
+            "supportsDisassembleRequest": false,
+            "supportTerminateDebuggee": false,
+            "supportSuspendDebuggee": false
         });
 
         self.send_success_response(request, writer, Some(capabilities))?;
@@ -200,6 +206,73 @@ impl DebugAdapter {
                 )
             }
         }
+    }
+
+    fn handle_disconnect<W>(&mut self, request: &Request, writer: &mut DapWriter<W>) -> Result<()>
+    where
+        W: Write,
+    {
+        if matches!(
+            self.state,
+            AdapterState::Created
+                | AdapterState::Launching
+                | AdapterState::Terminated
+                | AdapterState::Disconnected
+        ) {
+            return self.send_error_response(
+                request,
+                writer,
+                format!(
+                    "disconnect is not valid while adapter is in state {:?}",
+                    self.state
+                ),
+            );
+        }
+
+        let arguments = match request.arguments.clone() {
+            Some(arguments) => match serde_json::from_value::<DisconnectArguments>(arguments) {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    return self.send_error_response(
+                        request,
+                        writer,
+                        format!("invalid disconnect arguments: {error}"),
+                    );
+                }
+            },
+            None => DisconnectArguments::default(),
+        };
+
+        if arguments.suspend_debuggee {
+            return self.send_error_response(request, writer, "suspendDebuggee is not supported");
+        }
+
+        if arguments.terminate_debuggee {
+            debug!(
+                "terminateDebuggee was requested, but inferior termination \
+                 is not implemented yet"
+            );
+        }
+
+        if let Some(session) = self.session.as_mut() {
+            if let Err(error) = session.shutdown() {
+                return self.send_error_response(
+                    request,
+                    writer,
+                    format!("failed to shut down GDB session: {error}"),
+                );
+            }
+        }
+
+        self.session = None;
+        self.state = AdapterState::Terminated;
+
+        self.send_success_response(request, writer, None)?;
+
+        let event = Event::new(self.sequence.next(), "terminated");
+        writer.write_message(&OutgoingMessage::Event(event))?;
+
+        Ok(())
     }
 
     fn create_session(&self, arguments: LaunchArguments) -> Result<(GdbSession, GdbSessionOutput)> {
@@ -387,7 +460,9 @@ mod tests {
                     "supportsStepBack": false,
                     "supportsSetVariable": false,
                     "supportsReadMemoryRequest": false,
-                    "supportsDisassembleRequest": false
+                    "supportsDisassembleRequest": false,
+                    "supportTerminateDebuggee": false,
+                    "supportSuspendDebuggee": false
                 }
             })
         );
@@ -584,6 +659,162 @@ mod tests {
             .expect("error response should contain a message");
 
         assert!(message.starts_with("invalid launch arguments:"));
+    }
+
+    #[test]
+    fn disconnects_after_initialize() {
+        let input = encode_messages(&[
+            json!({
+                "seq": 1,
+                "type": "request",
+                "command": "initialize"
+            }),
+            json!({
+                "seq": 2,
+                "type": "request",
+                "command": "disconnect",
+                "arguments": {}
+            }),
+        ]);
+
+        let (_, messages) = run_adapter(input);
+
+        assert_eq!(messages.len(), 4);
+
+        assert_eq!(
+            messages[2],
+            json!({
+                "seq": 3,
+                "type": "response",
+                "request_seq": 2,
+                "success": true,
+                "command": "disconnect"
+            })
+        );
+
+        assert_eq!(
+            messages[3],
+            json!({
+                "seq": 4,
+                "type": "event",
+                "event": "terminated"
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_disconnect_without_arguments() {
+        let input = encode_messages(&[
+            json!({
+                "seq": 1,
+                "type": "request",
+                "command": "initialize"
+            }),
+            json!({
+                "seq": 2,
+                "type": "request",
+                "command": "disconnect"
+            }),
+        ]);
+
+        let (_, messages) = run_adapter(input);
+
+        assert_eq!(messages[2]["success"], true);
+        assert_eq!(messages[2]["command"], "disconnect");
+        assert_eq!(messages[3]["event"], "terminated");
+    }
+
+    #[test]
+    fn rejects_suspend_debuggee() {
+        let input = encode_messages(&[
+            json!({
+                "seq": 1,
+                "type": "request",
+                "command": "initialize"
+            }),
+            json!({
+                "seq": 2,
+                "type": "request",
+                "command": "disconnect",
+                "arguments": {
+                    "suspendDebuggee": true
+                }
+            }),
+        ]);
+
+        let (_, messages) = run_adapter(input);
+
+        assert_eq!(
+            messages[2],
+            json!({
+                "seq": 3,
+                "type": "response",
+                "request_seq": 2,
+                "success": false,
+                "command": "disconnect",
+                "message": "suspendDebuggee is not supported"
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_disconnect_before_initialize() {
+        let input = encode_messages(&[json!({
+            "seq": 1,
+            "type": "request",
+            "command": "disconnect"
+        })]);
+
+        let (_, messages) = run_adapter(input);
+
+        assert_eq!(
+            messages,
+            vec![json!({
+                "seq": 1,
+                "type": "response",
+                "request_seq": 1,
+                "success": false,
+                "command": "disconnect",
+                "message": "disconnect is not valid while adapter is in state Created"
+            })]
+        );
+    }
+
+    #[test]
+    fn accepts_repeated_disconnect() {
+        let input = encode_messages(&[
+            json!({
+                "seq": 1,
+                "type": "request",
+                "command": "initialize"
+            }),
+            json!({
+                "seq": 2,
+                "type": "request",
+                "command": "disconnect"
+            }),
+            json!({
+                "seq": 3,
+                "type": "request",
+                "command": "disconnect"
+            }),
+        ]);
+
+        let (_, messages) = run_adapter(input);
+
+        assert_eq!(messages.len(), 5);
+
+        assert_eq!(
+            messages[4],
+            json!({
+                "seq": 5,
+                "type": "response",
+                "request_seq": 3,
+                "success": false,
+                "command": "disconnect",
+                "message": "disconnect is not valid while adapter is in state Terminated"
+            })
+        );
     }
 
     fn run_adapter(input: Vec<u8>) -> (DebugAdapter, Vec<Value>) {

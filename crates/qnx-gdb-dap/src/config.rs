@@ -24,13 +24,31 @@ pub struct LaunchArguments {
     pub gdb_arguments: Vec<String>,
 }
 
+/// Arguments of the DAP `disconnect` request.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DisconnectArguments {
+    /// Whether the debug adapter should terminate the inferior.
+    ///
+    /// Inferior termination is not implemented yet, but the field is accepted
+    /// for DAP compatibility.
+    #[serde(default)]
+    pub terminate_debuggee: bool,
+
+    /// Whether the debug adapter should suspend the inferior.
+    ///
+    /// This is not supported by the first adapter version.
+    #[serde(default)]
+    pub suspend_debuggee: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use serde_json::json;
 
-    use super::LaunchArguments;
+    use super::{DisconnectArguments, LaunchArguments};
 
     #[test]
     fn deserializes_launch_arguments() {
@@ -68,5 +86,30 @@ mod tests {
 
         assert_eq!(arguments.working_directory, None);
         assert!(arguments.gdb_arguments.is_empty());
+    }
+
+    #[test]
+    fn deserializes_disconnect_arguments() {
+        let arguments: DisconnectArguments = serde_json::from_value(json!({
+            "terminateDebuggee": true,
+            "suspendDebuggee": false
+        }))
+        .expect("disconnect arguments should deserialize");
+
+        assert_eq!(
+            arguments,
+            DisconnectArguments {
+                terminate_debuggee: true,
+                suspend_debuggee: false,
+            }
+        );
+    }
+
+    #[test]
+    fn uses_disconnect_argument_defaults() {
+        let arguments: DisconnectArguments = serde_json::from_value(json!({}))
+            .expect("empty disconnect arguments should deserialize");
+
+        assert_eq!(arguments, DisconnectArguments::default());
     }
 }

@@ -75,6 +75,14 @@ requests = [
             "target": "192.168.1.28:8080",
         },
     },
+    {
+        "seq": 3,
+        "type": "request",
+        "command": "disconnect",
+        "arguments": {
+            "terminateDebuggee": False,
+        },
+    },
 ]
 
 process = subprocess.run(
