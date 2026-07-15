@@ -119,6 +119,12 @@ requests = [
     {
         "seq": 5,
         "type": "request",
+        "command": "configurationDone",
+        "arguments": {},
+    },
+    {
+        "seq": 6,
+        "type": "request",
         "command": "disconnect",
         "arguments": {
             "terminateDebuggee": False,

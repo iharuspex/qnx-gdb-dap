@@ -24,6 +24,9 @@ pub enum AdapterState {
     /// GDB is connected to the remote QNX target.
     Connected,
 
+    /// The client has completed initial debug-session configuration.
+    Configured,
+
     /// The debug session has been explicitly terminated.
     Terminated,
 
@@ -99,6 +102,7 @@ impl DebugAdapter {
             "initialize" => self.handle_initialize(request, writer),
             "launch" => self.handle_launch(request, writer),
             "setBreakpoints" => self.handle_set_breakpoints(request, writer),
+            "configurationDone" => self.handle_configuration_done(request, writer),
             "disconnect" => self.handle_disconnect(request, writer),
             command => {
                 warn!(
@@ -129,7 +133,7 @@ impl DebugAdapter {
         }
 
         let capabilities = json!({
-            "supportsConfigurationDoneRequest": false,
+            "supportsConfigurationDoneRequest": true,
             "supportsFunctionBreakpoints": false,
             "supportsConditionalBreakpoints": false,
             "supportsHitConditionalBreakpoints": false,
@@ -219,7 +223,10 @@ impl DebugAdapter {
     where
         W: Write,
     {
-        if self.state != AdapterState::Connected {
+        if !matches!(
+            self.state,
+            AdapterState::Connected | AdapterState::Configured
+        ) {
             return self.send_error_response(
                 request,
                 writer,
@@ -363,6 +370,43 @@ impl DebugAdapter {
         //         format!("failed to set source breakpoints: {error}"),
         //     ),
         // }
+    }
+
+    fn handle_configuration_done<W>(
+        &mut self,
+        request: &Request,
+        writer: &mut DapWriter<W>,
+    ) -> Result<()>
+    where
+        W: Write,
+    {
+        if self.state != AdapterState::Connected {
+            return self.send_error_response(
+                request,
+                writer,
+                format!(
+                    "configurationDone is not valid while adapter is in state {:?}",
+                    self.state
+                ),
+            );
+        }
+
+        if let Some(arguments) = &request.arguments {
+            if !arguments.as_object().is_some_and(serde_json::Map::is_empty) {
+                debug!(
+                    arguments = ?arguments,
+                    "ignoring configurationDone arguments"
+                );
+            }
+        }
+
+        if self.session.is_none() {
+            return self.send_error_response(request, writer, "GDB session is not available");
+        }
+
+        self.state = AdapterState::Configured;
+
+        self.send_success_response(request, writer, None)
     }
 
     fn handle_disconnect<W>(&mut self, request: &Request, writer: &mut DapWriter<W>) -> Result<()>
@@ -607,7 +651,7 @@ mod tests {
                 "success": true,
                 "command": "initialize",
                 "body": {
-                    "supportsConfigurationDoneRequest": false,
+                    "supportsConfigurationDoneRequest": true,
                     "supportsFunctionBreakpoints": false,
                     "supportsConditionalBreakpoints": false,
                     "supportsHitConditionalBreakpoints": false,
@@ -965,6 +1009,64 @@ mod tests {
         assert_eq!(
             messages[0]["message"],
             "breakpoint line must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn rejects_configuration_done_before_launch() {
+        let input = encode_messages(&[
+            json!({
+                "seq": 1,
+                "type": "request",
+                "command": "initialize"
+            }),
+            json!({
+                "seq": 2,
+                "type": "request",
+                "command": "configurationDone"
+            }),
+        ]);
+
+        let (_, messages) = run_adapter(input);
+
+        assert_eq!(messages.len(), 3);
+
+        assert_eq!(
+            messages[2],
+            json!({
+                "seq": 3,
+                "type": "response",
+                "request_seq": 2,
+                "success": false,
+                "command": "configurationDone",
+                "message": "configurationDone is not valid while adapter is in state Initialized"
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_repeated_configuration_done() {
+        let mut adapter = DebugAdapter::new();
+        adapter.state = AdapterState::Configured;
+
+        let input = encode_messages(&[json!({
+            "seq": 1,
+            "type": "request",
+            "command": "configurationDone"
+        })]);
+
+        let (_, messages) = run_adapter_instance(adapter, input);
+
+        assert_eq!(
+            messages[0],
+            json!({
+                "seq": 1,
+                "type": "response",
+                "request_seq": 1,
+                "success": false,
+                "command": "configurationDone",
+                "message": "configurationDone is not valid while adapter is in state Configured"
+            })
         );
     }
 
