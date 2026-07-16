@@ -18,11 +18,11 @@ fn main() -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
 
-    let mut reader = DapReader::new(BufReader::new(stdin.lock()));
-    let mut writer = DapWriter::new(BufWriter::new(stdout.lock()));
+    let reader = DapReader::new(BufReader::new(stdin));
+    let mut writer = DapWriter::new(BufWriter::new(stdout));
     let mut adapter = DebugAdapter::new();
 
-    adapter.run(&mut reader, &mut writer)
+    adapter.run(reader, &mut writer)
 }
 
 fn initialize_logging() {

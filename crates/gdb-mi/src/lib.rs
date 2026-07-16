@@ -24,11 +24,13 @@ mod value;
 pub use breakpoint::{GdbBreakpoint, SourceBreakpoint};
 pub use command::{MiCommand, MiTokenGenerator, commands};
 pub use deployment::{GdbDeployment, GdbDeploymentResult};
-pub use execution::{GdbRunStarted, GdbSessionEvent, GdbStopReason, GdbStoppedFrame};
+pub use execution::{
+    GdbRunStarted, GdbSessionEvent, GdbSessionEventPoll, GdbStopReason, GdbStoppedFrame,
+};
 pub use parser::{MiParseError, parse_record};
 pub use process::{
-    GdbCommandResult, GdbEvent, GdbExecutionEvent, GdbExecutionStart, GdbProcess, GdbProcessConfig,
-    GdbProcessError, GdbReaderError, GdbRecordPoll, is_gdb_file,
+    GdbCommandResult, GdbEvent, GdbExecutionEvent, GdbExecutionPoll, GdbExecutionStart, GdbProcess,
+    GdbProcessConfig, GdbProcessError, GdbReaderError, GdbRecordPoll, is_gdb_file,
 };
 pub use record::{MiAsyncRecord, MiRecord, MiResultRecord};
 pub use session::{

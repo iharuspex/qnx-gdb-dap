@@ -79,6 +79,19 @@ pub enum GdbExecutionEvent {
     Prompt,
 }
 
+/// Result of polling for a post-execution GDB event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GdbExecutionPoll {
+    /// One execution event is available.
+    Event(GdbExecutionEvent),
+
+    /// No record is currently available.
+    Pending,
+
+    /// GDB closed its output.
+    EndOfFile,
+}
+
 /// Result of one GDB/MI command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GdbCommandResult {
@@ -515,6 +528,46 @@ impl GdbProcess {
             };
 
             return Ok(Some(event));
+        }
+    }
+
+    /// Attempts to receive one execution event without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the GDB reader thread failed or its channel closed
+    /// unexpectedly.
+    pub fn try_next_execution_event(&mut self) -> Result<GdbExecutionPoll, GdbProcessError> {
+        loop {
+            let record = match self.try_next_record()? {
+                GdbRecordPoll::Record(record) => record,
+
+                GdbRecordPoll::Pending => {
+                    return Ok(GdbExecutionPoll::Pending);
+                }
+
+                GdbRecordPoll::EndOfFile => {
+                    return Ok(GdbExecutionPoll::EndOfFile);
+                }
+            };
+
+            let event = match record {
+                MiRecord::Result(result) => GdbExecutionEvent::Result(result),
+
+                MiRecord::ExecAsync(_) | MiRecord::StatusAsync(_) | MiRecord::NotifyAsync(_) => {
+                    GdbExecutionEvent::Async(record)
+                }
+
+                MiRecord::ConsoleStream(_) | MiRecord::TargetStream(_) | MiRecord::LogStream(_) => {
+                    GdbExecutionEvent::Stream(record)
+                }
+
+                MiRecord::Prompt => GdbExecutionEvent::Prompt,
+
+                MiRecord::Empty => continue,
+            };
+
+            return Ok(GdbExecutionPoll::Event(event));
         }
     }
 

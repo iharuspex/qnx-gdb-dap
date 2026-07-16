@@ -112,3 +112,16 @@ pub struct GdbRunStarted {
     /// Events received before the initial result record.
     pub initial_events: Vec<GdbSessionEvent>,
 }
+
+/// Result of polling the running inferior for an event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GdbSessionEventPoll {
+    /// One event is available.
+    Event(GdbSessionEvent),
+
+    /// No event is currently available.
+    Pending,
+
+    /// GDB closed its output stream.
+    EndOfFile,
+}

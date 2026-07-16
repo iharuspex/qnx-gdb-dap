@@ -7,10 +7,10 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 use crate::{
-    GdbBreakpoint, GdbDeployment, GdbDeploymentResult, GdbEvent, GdbExecutionEvent, GdbProcess,
-    GdbProcessConfig, GdbProcessError, GdbRunStarted, GdbSessionEvent, GdbStopReason,
-    GdbStoppedFrame, MiAsyncRecord, MiRecord, MiResult, MiResultRecord, SourceBreakpoint, commands,
-    find_result,
+    GdbBreakpoint, GdbDeployment, GdbDeploymentResult, GdbEvent, GdbExecutionEvent,
+    GdbExecutionPoll, GdbProcess, GdbProcessConfig, GdbProcessError, GdbRunStarted,
+    GdbSessionEvent, GdbSessionEventPoll, GdbStopReason, GdbStoppedFrame, MiAsyncRecord, MiRecord,
+    MiResult, MiResultRecord, SourceBreakpoint, commands, find_result,
 };
 
 /// Configuration of a remote QNX debugging session.
@@ -397,22 +397,44 @@ impl GdbSession {
             //     self.state = GdbSessionState::Stopped;
             // }
 
-            match &event {
-                GdbSessionEvent::Stopped {
-                    reason: GdbStopReason::Exited { .. } | GdbStopReason::ExitedSignalled { .. },
-                    ..
-                } => {
-                    self.state = GdbSessionState::Deployed;
-                }
-
-                GdbSessionEvent::Stopped { .. } => {
-                    self.state = GdbSessionState::Stopped;
-                }
-
-                _ => {}
-            }
+            update_session_state_from_event(&mut self.state, &event);
 
             return Ok(event);
+        }
+    }
+
+    /// Polls for one inferior execution event without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if receiving or converting GDB output fails.
+    pub fn try_next_execution_event(&mut self) -> Result<GdbSessionEventPoll, GdbSessionError> {
+        self.require_state(
+            "poll execution event",
+            &[GdbSessionState::Running, GdbSessionState::Stopped],
+        )?;
+
+        loop {
+            let event = match self.process.try_next_execution_event()? {
+                GdbExecutionPoll::Pending => {
+                    return Ok(GdbSessionEventPoll::Pending);
+                }
+
+                GdbExecutionPoll::EndOfFile => {
+                    self.state = GdbSessionState::Terminated;
+                    return Ok(GdbSessionEventPoll::EndOfFile);
+                }
+
+                GdbExecutionPoll::Event(event) => event,
+            };
+
+            let Some(event) = self.convert_execution_event(event)? else {
+                continue;
+            };
+
+            update_session_state_from_event(&mut self.state, &event);
+
+            return Ok(GdbSessionEventPoll::Event(event));
         }
     }
 
@@ -864,6 +886,27 @@ fn parse_stopped_frame(results: &[MiResult]) -> GdbStoppedFrame {
         function,
         file,
         line,
+    }
+}
+
+fn update_session_state_from_event(state: &mut GdbSessionState, event: &GdbSessionEvent) {
+    match event {
+        GdbSessionEvent::Stopped {
+            reason: GdbStopReason::Exited { .. } | GdbStopReason::ExitedSignalled { .. },
+            ..
+        } => {
+            *state = GdbSessionState::Deployed;
+        }
+
+        GdbSessionEvent::Stopped { .. } => {
+            *state = GdbSessionState::Stopped;
+        }
+
+        GdbSessionEvent::EndOfFile => {
+            *state = GdbSessionState::Terminated;
+        }
+
+        _ => {}
     }
 }
 

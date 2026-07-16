@@ -1,14 +1,19 @@
-use std::io::{BufRead, Write};
+use std::{
+    io::{BufRead, Write},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    thread,
+    time::Duration,
+};
 
 use crate::{
     DapBreakpoint, DeploymentArguments, DisconnectArguments, LaunchArguments,
     SetBreakpointsArguments,
 };
 use anyhow::Result;
-use qnx_dap::{DapReader, DapWriter, Event, OutgoingMessage, Request, Response};
+use qnx_dap::{DapReadError, DapReader, DapWriter, Event, OutgoingMessage, Request, Response};
 use qnx_gdb_mi::{
-    GdbDeployment, GdbEvent, GdbSession, GdbSessionConfig, GdbSessionOutput, MiRecord,
-    SourceBreakpoint,
+    GdbDeployment, GdbEvent, GdbSession, GdbSessionConfig, GdbSessionEvent, GdbSessionEventPoll,
+    GdbSessionOutput, GdbStopReason, MiRecord, SourceBreakpoint,
 };
 use serde_json::json;
 use tracing::{debug, info, warn};
@@ -31,11 +36,24 @@ pub enum AdapterState {
     /// The client has completed initial debug-session configuration.
     Configured,
 
+    /// The inferior is currently running.
+    Running,
+
+    /// The inferior is stopped and can be inspected.
+    Stopped,
+
     /// The debug session has been explicitly terminated.
     Terminated,
 
     /// The DAP input stream has been closed.
     Disconnected,
+}
+
+#[derive(Debug)]
+enum DapInput {
+    Request(Request),
+    EndOfFile,
+    Error(DapReadError),
 }
 
 /// Stateful DAP request handler.
@@ -63,39 +81,96 @@ impl DebugAdapter {
         self.state
     }
 
-    /// Processes DAP requests until the input stream reaches EOF.
+    /// Processes DAP requests and asynchronous GDB events.
+    ///
+    /// The DAP input stream is read in a background thread. Responses and events
+    /// are always written from the current thread.
     ///
     /// # Errors
     ///
-    /// Returns an error if a DAP message cannot be read, deserialized,
-    /// serialized, or written.
-    pub fn run<R, W>(&mut self, reader: &mut DapReader<R>, writer: &mut DapWriter<W>) -> Result<()>
+    /// Returns an error if:
+    ///
+    /// - the DAP reader thread cannot be started;
+    /// - a DAP request cannot be decoded;
+    /// - a response or event cannot be written;
+    /// - handling a debugger request fails.
+    pub fn run<R, W>(&mut self, reader: DapReader<R>, writer: &mut DapWriter<W>) -> Result<()>
     where
-        R: BufRead,
+        R: BufRead + Send + 'static,
         W: Write,
     {
-        while let Some(request) = reader.read_message::<Request>()? {
-            debug!(
-                request_seq = request.seq,
-                command = %request.command,
-                state = ?self.state,
-                "received DAP request"
-            );
+        let (sender, receiver) = mpsc::channel();
 
-            self.handle_request(&request, writer)?;
+        let reader_thread = thread::Builder::new()
+            .name("qnx-dap-reader".to_owned())
+            .spawn(move || run_dap_reader(reader, sender))?;
+
+        let result = self.run_event_loop(&receiver, writer);
+
+        if reader_thread.join().is_err() {
+            warn!("DAP reader thread panicked");
         }
 
-        if let Some(session) = self.session.as_mut()
-            && let Err(error) = session.shutdown()
-        {
-            warn!(%error, "failed to shut down GDB session");
+        result
+    }
+
+    fn run_event_loop<W>(
+        &mut self,
+        receiver: &Receiver<DapInput>,
+        writer: &mut DapWriter<W>,
+    ) -> Result<()>
+    where
+        W: Write,
+    {
+        let mut input_closed = false;
+
+        while !input_closed {
+            match receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(DapInput::Request(request)) => {
+                    debug!(
+                        request_seq = request.seq,
+                        command = %request.command,
+                        state = ?self.state,
+                        "received DAP request"
+                    );
+
+                    self.handle_request(&request, writer)?;
+                }
+
+                Ok(DapInput::EndOfFile) => {
+                    input_closed = true;
+                }
+
+                Ok(DapInput::Error(error)) => {
+                    return Err(error.into());
+                }
+
+                Err(RecvTimeoutError::Timeout) => {}
+
+                Err(RecvTimeoutError::Disconnected) => {
+                    input_closed = true;
+                }
+            }
+
+            self.drain_gdb_events(writer)?;
         }
 
-        self.session = None;
+        self.shutdown_session_after_eof();
         self.state = AdapterState::Disconnected;
+
         info!("DAP input stream closed");
 
         Ok(())
+    }
+
+    fn shutdown_session_after_eof(&mut self) {
+        if let Some(session) = self.session.as_mut() {
+            if let Err(error) = session.shutdown() {
+                warn!(%error, "failed to shut down GDB session");
+            }
+        }
+
+        self.session = None;
     }
 
     fn handle_request<W>(&mut self, request: &Request, writer: &mut DapWriter<W>) -> Result<()>
@@ -229,7 +304,7 @@ impl DebugAdapter {
     {
         if !matches!(
             self.state,
-            AdapterState::Connected | AdapterState::Configured
+            AdapterState::Connected | AdapterState::Configured | AdapterState::Stopped
         ) {
             return self.send_error_response(
                 request,
@@ -404,13 +479,281 @@ impl DebugAdapter {
             }
         }
 
-        if self.session.is_none() {
-            return self.send_error_response(request, writer, "GDB session is not available");
-        }
-
         self.state = AdapterState::Configured;
 
-        self.send_success_response(request, writer, None)
+        let run_result = {
+            let Some(session) = self.session.as_mut() else {
+                self.state = AdapterState::Connected;
+
+                return self.send_error_response(request, writer, "GDB session is not available");
+            };
+
+            session.run()
+        };
+
+        match run_result {
+            Ok(started) => {
+                self.state = AdapterState::Running;
+
+                self.send_success_response(request, writer, None)?;
+
+                for event in started.initial_events {
+                    self.send_gdb_session_event(writer, event)?;
+                }
+
+                Ok(())
+            }
+
+            Err(error) => {
+                self.state = AdapterState::Connected;
+
+                self.send_error_response(
+                    request,
+                    writer,
+                    format!("failed to start QNX inferior: {error}"),
+                )
+            }
+        }
+    }
+
+    fn drain_gdb_events<W>(&mut self, writer: &mut DapWriter<W>) -> Result<()>
+    where
+        W: Write,
+    {
+        if !matches!(self.state, AdapterState::Running | AdapterState::Stopped) {
+            return Ok(());
+        }
+
+        loop {
+            let poll_result = {
+                let Some(session) = self.session.as_mut() else {
+                    return Ok(());
+                };
+
+                session.try_next_execution_event()
+            };
+
+            match poll_result {
+                Ok(GdbSessionEventPoll::Pending) => {
+                    return Ok(());
+                }
+
+                Ok(GdbSessionEventPoll::EndOfFile) => {
+                    self.state = AdapterState::Terminated;
+
+                    let event = Event::new(self.sequence.next(), "terminated");
+
+                    writer.write_message(&OutgoingMessage::Event(event))?;
+
+                    return Ok(());
+                }
+
+                Ok(GdbSessionEventPoll::Event(event)) => {
+                    self.send_gdb_session_event(writer, event)?;
+                }
+
+                Err(error) => {
+                    self.send_output_event(
+                        writer,
+                        "stderr",
+                        format!("GDB event error: {error}\n"),
+                    )?;
+
+                    self.state = AdapterState::Terminated;
+
+                    let event = Event::new(self.sequence.next(), "terminated");
+
+                    writer.write_message(&OutgoingMessage::Event(event))?;
+
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    fn send_gdb_session_event<W>(
+        &mut self,
+        writer: &mut DapWriter<W>,
+        event: GdbSessionEvent,
+    ) -> Result<()>
+    where
+        W: Write,
+    {
+        match event {
+            GdbSessionEvent::TargetOutput(output) => {
+                self.send_output_event(writer, "stdout", output)
+            }
+
+            GdbSessionEvent::ConsoleOutput(output) => {
+                self.send_output_event(writer, "console", output)
+            }
+
+            GdbSessionEvent::DiagnosticOutput(output) => {
+                self.send_output_event(writer, "stderr", output)
+            }
+
+            GdbSessionEvent::Stopped {
+                reason,
+                thread_id,
+                frame: _,
+            } => self.send_stopped_event(writer, reason, thread_id),
+
+            GdbSessionEvent::LateResult { class, message, .. } => {
+                let output = match message {
+                    Some(message) => {
+                        format!("GDB execution result {class}: {message}\n")
+                    }
+
+                    None => {
+                        format!("GDB execution result: {class}\n")
+                    }
+                };
+
+                self.send_output_event(writer, "stderr", output)
+            }
+
+            GdbSessionEvent::AsyncRecord { class } => {
+                debug!(
+                    %class,
+                    "unmapped GDB asynchronous record"
+                );
+
+                Ok(())
+            }
+
+            GdbSessionEvent::EndOfFile => {
+                self.state = AdapterState::Terminated;
+
+                let event = Event::new(self.sequence.next(), "terminated");
+
+                writer.write_message(&OutgoingMessage::Event(event))?;
+
+                Ok(())
+            }
+        }
+    }
+
+    fn send_output_event<W>(
+        &mut self,
+        writer: &mut DapWriter<W>,
+        category: &str,
+        output: String,
+    ) -> Result<()>
+    where
+        W: Write,
+    {
+        let event = Event::with_body(
+            self.sequence.next(),
+            "output",
+            serde_json::json!({
+                "category": category,
+                "output": output
+            }),
+        );
+
+        writer.write_message(&OutgoingMessage::Event(event))?;
+
+        Ok(())
+    }
+
+    fn send_stopped_event<W>(
+        &mut self,
+        writer: &mut DapWriter<W>,
+        reason: GdbStopReason,
+        thread_id: Option<u64>,
+    ) -> Result<()>
+    where
+        W: Write,
+    {
+        let thread_id = thread_id.unwrap_or(1);
+
+        let (reason_text, description, hit_ids) = match reason {
+            GdbStopReason::Breakpoint { breakpoint_number } => (
+                "breakpoint",
+                None,
+                breakpoint_number.map(|number| vec![number]),
+            ),
+
+            GdbStopReason::Step => ("step", None, None),
+
+            GdbStopReason::Signal { name, meaning } => {
+                let description = match (name, meaning) {
+                    (Some(name), Some(meaning)) => Some(format!("{name}: {meaning}")),
+
+                    (Some(name), None) => Some(name),
+                    (None, Some(meaning)) => Some(meaning),
+                    (None, None) => None,
+                };
+
+                ("exception", description, None)
+            }
+
+            GdbStopReason::Unknown { reason } => ("pause", reason, None),
+
+            GdbStopReason::Exited { exit_code } => {
+                return self.send_exit_events(writer, exit_code.unwrap_or(0));
+            }
+
+            GdbStopReason::ExitedSignalled { signal_name } => {
+                if let Some(signal_name) = signal_name {
+                    self.send_output_event(
+                        writer,
+                        "stderr",
+                        format!(
+                            "Inferior exited because of signal \
+                             {signal_name}\n"
+                        ),
+                    )?;
+                }
+
+                return self.send_exit_events(writer, 1);
+            }
+        };
+
+        self.state = AdapterState::Stopped;
+
+        let mut body = serde_json::json!({
+            "reason": reason_text,
+            "threadId": thread_id,
+            "allThreadsStopped": true
+        });
+
+        if let Some(description) = description {
+            body["description"] = serde_json::Value::String(description);
+        }
+
+        if let Some(hit_ids) = hit_ids {
+            body["hitBreakpointIds"] = serde_json::json!(hit_ids);
+        }
+
+        let event = Event::with_body(self.sequence.next(), "stopped", body);
+
+        writer.write_message(&OutgoingMessage::Event(event))?;
+
+        Ok(())
+    }
+
+    fn send_exit_events<W>(&mut self, writer: &mut DapWriter<W>, exit_code: i32) -> Result<()>
+    where
+        W: Write,
+    {
+        self.state = AdapterState::Terminated;
+
+        let exited = Event::with_body(
+            self.sequence.next(),
+            "exited",
+            serde_json::json!({
+                "exitCode": exit_code
+            }),
+        );
+
+        writer.write_message(&OutgoingMessage::Event(exited))?;
+
+        let terminated = Event::new(self.sequence.next(), "terminated");
+
+        writer.write_message(&OutgoingMessage::Event(terminated))?;
+
+        Ok(())
     }
 
     fn handle_disconnect<W>(&mut self, request: &Request, writer: &mut DapWriter<W>) -> Result<()>
@@ -633,6 +976,31 @@ fn log_mi_record(context: &str, record: &MiRecord) {
 
         other => {
             debug!(%context, record = ?other, "GDB MI record");
+        }
+    }
+}
+
+fn run_dap_reader<R>(mut reader: DapReader<R>, sender: Sender<DapInput>)
+where
+    R: BufRead,
+{
+    loop {
+        match reader.read_message::<Request>() {
+            Ok(Some(request)) => {
+                if sender.send(DapInput::Request(request)).is_err() {
+                    return;
+                }
+            }
+
+            Ok(None) => {
+                let _ = sender.send(DapInput::EndOfFile);
+                return;
+            }
+
+            Err(error) => {
+                let _ = sender.send(DapInput::Error(error));
+                return;
+            }
         }
     }
 }
@@ -944,11 +1312,11 @@ mod tests {
         })]);
 
         let cursor = Cursor::new(input);
-        let mut reader = DapReader::new(BufReader::new(cursor));
+        let reader = DapReader::new(BufReader::new(cursor));
         let mut writer = DapWriter::new(Vec::new());
 
         adapter
-            .run(&mut reader, &mut writer)
+            .run(reader, &mut writer)
             .expect("adapter should process request");
 
         let messages = decode_messages(writer.into_inner());
@@ -988,11 +1356,11 @@ mod tests {
         })]);
 
         let cursor = Cursor::new(input);
-        let mut reader = DapReader::new(BufReader::new(cursor));
+        let reader = DapReader::new(BufReader::new(cursor));
         let mut writer = DapWriter::new(Vec::new());
 
         adapter
-            .run(&mut reader, &mut writer)
+            .run(reader, &mut writer)
             .expect("adapter should process request");
 
         let messages = decode_messages(writer.into_inner());
@@ -1025,11 +1393,11 @@ mod tests {
         })]);
 
         let cursor = Cursor::new(input);
-        let mut reader = DapReader::new(BufReader::new(cursor));
+        let reader = DapReader::new(BufReader::new(cursor));
         let mut writer = DapWriter::new(Vec::new());
 
         adapter
-            .run(&mut reader, &mut writer)
+            .run(reader, &mut writer)
             .expect("adapter should process request");
 
         let messages = decode_messages(writer.into_inner());
@@ -1263,11 +1631,11 @@ mod tests {
         input: Vec<u8>,
     ) -> (DebugAdapter, Vec<Value>) {
         let cursor = Cursor::new(input);
-        let mut reader = DapReader::new(BufReader::new(cursor));
+        let reader = DapReader::new(BufReader::new(cursor));
         let mut writer = DapWriter::new(Vec::new());
 
         adapter
-            .run(&mut reader, &mut writer)
+            .run(reader, &mut writer)
             .expect("adapter should process valid input");
 
         let messages = decode_messages(writer.into_inner());
