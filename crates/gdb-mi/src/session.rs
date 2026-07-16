@@ -7,8 +7,10 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 use crate::{
-    GdbBreakpoint, GdbDeployment, GdbDeploymentResult, GdbEvent, GdbProcess, GdbProcessConfig,
-    GdbProcessError, MiRecord, MiResultRecord, SourceBreakpoint, commands, find_result,
+    GdbBreakpoint, GdbDeployment, GdbDeploymentResult, GdbEvent, GdbExecutionEvent, GdbProcess,
+    GdbProcessConfig, GdbProcessError, GdbRunStarted, GdbSessionEvent, GdbStopReason,
+    GdbStoppedFrame, MiAsyncRecord, MiRecord, MiResult, MiResultRecord, SourceBreakpoint, commands,
+    find_result,
 };
 
 /// Configuration of a remote QNX debugging session.
@@ -84,6 +86,12 @@ pub enum GdbSessionState {
 
     /// The remote executable has been uploaded or selected.
     Deployed,
+
+    /// The inferior is currently running.
+    Running,
+
+    /// The inferior is stopped and can be inspected.
+    Stopped,
 
     /// GDB has terminated.
     Terminated,
@@ -260,7 +268,10 @@ impl GdbSession {
         source: &Path,
         breakpoints: &[SourceBreakpoint],
     ) -> Result<Vec<GdbBreakpoint>, GdbSessionError> {
-        self.require_state("set source breakpoints", &[GdbSessionState::Deployed])?;
+        self.require_state(
+            "set source breakpoints",
+            &[GdbSessionState::Deployed, GdbSessionState::Stopped],
+        )?;
 
         let source_text = path_to_utf8(source, "breakpoint source file")?;
 
@@ -306,6 +317,157 @@ impl GdbSession {
         }
 
         Ok(results)
+    }
+
+    /// Starts the remote QNX executable.
+    ///
+    /// The method waits only until GDB returns the initial `^running` result.
+    /// Later execution events must be consumed through
+    /// [`GdbSession::next_execution_event`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session is not deployed, GDB rejects the run
+    /// command, or communication with GDB fails.
+    pub fn run(&mut self) -> Result<GdbRunStarted, GdbSessionError> {
+        self.require_state("run inferior", &[GdbSessionState::Deployed])?;
+
+        let started = self.process.start_execution(commands::exec_run)?;
+
+        let token = started.token;
+        let result = started.result;
+        let initial_events = started
+            .events
+            .into_iter()
+            .filter_map(convert_initial_gdb_event)
+            .collect::<Vec<_>>();
+
+        match result.class.as_str() {
+            "running" => {
+                self.state = GdbSessionState::Running;
+
+                Ok(GdbRunStarted {
+                    token,
+                    initial_events,
+                })
+            }
+
+            "error" => {
+                let message = find_result(&result.results, "msg")
+                    .and_then(crate::MiValue::as_const)
+                    .unwrap_or("GDB failed to start the inferior")
+                    .to_owned();
+
+                Err(GdbSessionError::GdbCommand {
+                    operation: "exec-run",
+                    message,
+                })
+            }
+
+            actual => Err(GdbSessionError::UnexpectedResultClass {
+                operation: "exec-run",
+                actual: actual.to_owned(),
+                expected: vec!["running".to_owned(), "error".to_owned()],
+            }),
+        }
+    }
+
+    /// Waits for the next event produced while the inferior is running.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading or parsing GDB output fails.
+    pub fn next_execution_event(&mut self) -> Result<GdbSessionEvent, GdbSessionError> {
+        self.require_state(
+            "read execution event",
+            &[GdbSessionState::Running, GdbSessionState::Stopped],
+        )?;
+
+        loop {
+            let Some(event) = self.process.next_execution_event()? else {
+                self.state = GdbSessionState::Terminated;
+                return Ok(GdbSessionEvent::EndOfFile);
+            };
+
+            let Some(event) = self.convert_execution_event(event)? else {
+                continue;
+            };
+
+            // if matches!(event, GdbSessionEvent::Stopped { .. }) {
+            //     self.state = GdbSessionState::Stopped;
+            // }
+
+            match &event {
+                GdbSessionEvent::Stopped {
+                    reason: GdbStopReason::Exited { .. } | GdbStopReason::ExitedSignalled { .. },
+                    ..
+                } => {
+                    self.state = GdbSessionState::Deployed;
+                }
+
+                GdbSessionEvent::Stopped { .. } => {
+                    self.state = GdbSessionState::Stopped;
+                }
+
+                _ => {}
+            }
+
+            return Ok(event);
+        }
+    }
+
+    fn convert_execution_event(
+        &self,
+        event: GdbExecutionEvent,
+    ) -> Result<Option<GdbSessionEvent>, GdbSessionError> {
+        let converted = match event {
+            GdbExecutionEvent::Stream(MiRecord::TargetStream(output)) => {
+                Some(GdbSessionEvent::TargetOutput(output))
+            }
+
+            GdbExecutionEvent::Stream(MiRecord::ConsoleStream(output)) => {
+                Some(GdbSessionEvent::ConsoleOutput(output))
+            }
+
+            GdbExecutionEvent::Stream(MiRecord::LogStream(output)) => {
+                Some(GdbSessionEvent::DiagnosticOutput(output))
+            }
+
+            GdbExecutionEvent::Stream(_) => None,
+
+            GdbExecutionEvent::Async(MiRecord::ExecAsync(record)) => {
+                Some(convert_exec_async_record(&record)?)
+            }
+
+            GdbExecutionEvent::Async(MiRecord::StatusAsync(record))
+            | GdbExecutionEvent::Async(MiRecord::NotifyAsync(record)) => {
+                Some(GdbSessionEvent::AsyncRecord {
+                    class: record.class,
+                })
+            }
+
+            GdbExecutionEvent::Async(_) => None,
+
+            GdbExecutionEvent::Result(result) => {
+                let message = if result.class == "error" {
+                    find_result(&result.results, "msg")
+                        .and_then(crate::MiValue::as_const)
+                        .map(ToOwned::to_owned)
+                } else {
+                    None
+                };
+
+                Some(GdbSessionEvent::LateResult {
+                    token: result.token,
+                    class: result.class,
+                    message,
+                })
+            }
+
+            GdbExecutionEvent::Prompt => None,
+        };
+
+        Ok(converted)
     }
 
     fn remove_source_breakpoints(&mut self, source: &Path) -> Result<(), GdbSessionError> {
@@ -433,6 +595,30 @@ impl GdbSession {
         self.state = GdbSessionState::Terminated;
 
         Ok(())
+    }
+}
+
+fn convert_initial_gdb_event(event: GdbEvent) -> Option<GdbSessionEvent> {
+    match event {
+        GdbEvent::Stream(MiRecord::TargetStream(output)) => {
+            Some(GdbSessionEvent::TargetOutput(output))
+        }
+
+        GdbEvent::Stream(MiRecord::ConsoleStream(output)) => {
+            Some(GdbSessionEvent::ConsoleOutput(output))
+        }
+
+        GdbEvent::Stream(MiRecord::LogStream(output)) => {
+            Some(GdbSessionEvent::DiagnosticOutput(output))
+        }
+
+        GdbEvent::Async(MiRecord::ExecAsync(record))
+        | GdbEvent::Async(MiRecord::StatusAsync(record))
+        | GdbEvent::Async(MiRecord::NotifyAsync(record)) => Some(GdbSessionEvent::AsyncRecord {
+            class: record.class,
+        }),
+
+        GdbEvent::Stream(_) | GdbEvent::Async(_) => None,
     }
 }
 
@@ -575,6 +761,112 @@ fn parse_breakpoint_result(
     })
 }
 
+fn convert_exec_async_record(record: &MiAsyncRecord) -> Result<GdbSessionEvent, GdbSessionError> {
+    if record.class != "stopped" {
+        return Ok(GdbSessionEvent::AsyncRecord {
+            class: record.class.clone(),
+        });
+    }
+
+    let reason_text = find_result(&record.results, "reason").and_then(crate::MiValue::as_const);
+
+    let reason = parse_stop_reason(reason_text, &record.results);
+
+    let thread_id = find_result(&record.results, "thread-id")
+        .and_then(crate::MiValue::as_const)
+        .and_then(|value| value.parse::<u64>().ok());
+
+    let frame = find_result(&record.results, "frame")
+        .and_then(crate::MiValue::as_tuple)
+        .map(parse_stopped_frame);
+
+    Ok(GdbSessionEvent::Stopped {
+        reason,
+        thread_id,
+        frame,
+    })
+}
+
+fn parse_stop_reason(reason: Option<&str>, results: &[MiResult]) -> GdbStopReason {
+    match reason {
+        Some("breakpoint-hit") => {
+            let breakpoint_number = find_result(results, "bkptno")
+                .and_then(crate::MiValue::as_const)
+                .and_then(|value| value.parse::<u64>().ok());
+
+            GdbStopReason::Breakpoint { breakpoint_number }
+        }
+
+        Some("end-stepping-range" | "function-finished" | "location-reached") => {
+            GdbStopReason::Step
+        }
+
+        Some("signal-received") => {
+            let name = find_result(results, "signal-name")
+                .and_then(crate::MiValue::as_const)
+                .map(ToOwned::to_owned);
+
+            let meaning = find_result(results, "signal-meaning")
+                .and_then(crate::MiValue::as_const)
+                .map(ToOwned::to_owned);
+
+            GdbStopReason::Signal { name, meaning }
+        }
+
+        Some("exited-normally") => GdbStopReason::Exited { exit_code: Some(0) },
+
+        Some("exited") => {
+            let exit_code = find_result(results, "exit-code")
+                .and_then(crate::MiValue::as_const)
+                .and_then(parse_integer);
+
+            GdbStopReason::Exited { exit_code }
+        }
+
+        Some("exited-signalled") => {
+            let signal_name = find_result(results, "signal-name")
+                .and_then(crate::MiValue::as_const)
+                .map(ToOwned::to_owned);
+
+            GdbStopReason::ExitedSignalled { signal_name }
+        }
+
+        other => GdbStopReason::Unknown {
+            reason: other.map(ToOwned::to_owned),
+        },
+    }
+}
+
+fn parse_integer(value: &str) -> Option<i32> {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        i32::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse::<i32>().ok()
+    }
+}
+
+fn parse_stopped_frame(results: &[MiResult]) -> GdbStoppedFrame {
+    let address = find_tuple_const(results, "addr").map(ToOwned::to_owned);
+
+    let function = find_tuple_const(results, "func").map(ToOwned::to_owned);
+
+    let file = find_tuple_const(results, "fullname")
+        .or_else(|| find_tuple_const(results, "file"))
+        .map(PathBuf::from);
+
+    let line = find_tuple_const(results, "line").and_then(|value| value.parse::<u64>().ok());
+
+    GdbStoppedFrame {
+        address,
+        function,
+        file,
+        line,
+    }
+}
+
 fn find_tuple_const<'a>(results: &'a [crate::MiResult], name: &str) -> Option<&'a str> {
     find_result(results, name)?.as_const()
 }
@@ -654,11 +946,14 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use crate::{GdbDeployment, MiResult, MiResultRecord, MiValue};
+    use crate::{
+        GdbDeployment, GdbStopReason, GdbStoppedFrame, MiAsyncRecord, MiResult, MiResultRecord,
+        MiValue,
+    };
 
     use super::{
-        GdbSessionConfig, GdbSessionError, parse_breakpoint_result, require_result_class,
-        validate_config, validate_remote_program,
+        GdbSessionConfig, GdbSessionError, GdbSessionEvent, convert_exec_async_record,
+        parse_breakpoint_result, require_result_class, validate_config, validate_remote_program,
     };
 
     #[test]
@@ -741,6 +1036,72 @@ mod tests {
                 message,
             } if message == "Connection refused."
         ));
+    }
+
+    #[test]
+    fn converts_normal_exit_event() {
+        let record = MiAsyncRecord {
+            token: Some(7),
+            class: "stopped".to_owned(),
+            results: vec![MiResult::new(
+                "reason",
+                MiValue::Const("exited-normally".to_owned()),
+            )],
+        };
+
+        let event = convert_exec_async_record(&record).expect("exit event should convert");
+
+        assert_eq!(
+            event,
+            GdbSessionEvent::Stopped {
+                reason: GdbStopReason::Exited { exit_code: Some(0) },
+                thread_id: None,
+                frame: None,
+            }
+        );
+    }
+
+    #[test]
+    fn converts_breakpoint_stop_event() {
+        let record = MiAsyncRecord {
+            token: Some(6),
+            class: "stopped".to_owned(),
+            results: vec![
+                MiResult::new("reason", crate::MiValue::Const("breakpoint-hit".to_owned())),
+                MiResult::new("bkptno", crate::MiValue::Const("1".to_owned())),
+                MiResult::new("thread-id", crate::MiValue::Const("1".to_owned())),
+                MiResult::new(
+                    "frame",
+                    crate::MiValue::Tuple(vec![
+                        MiResult::new("addr", crate::MiValue::Const("0x001007d8".to_owned())),
+                        MiResult::new("func", crate::MiValue::Const("main".to_owned())),
+                        MiResult::new(
+                            "fullname",
+                            crate::MiValue::Const("/project/main.c".to_owned()),
+                        ),
+                        MiResult::new("line", crate::MiValue::Const("7".to_owned())),
+                    ]),
+                ),
+            ],
+        };
+
+        let event = convert_exec_async_record(&record).expect("stop event should convert");
+
+        assert_eq!(
+            event,
+            GdbSessionEvent::Stopped {
+                reason: GdbStopReason::Breakpoint {
+                    breakpoint_number: Some(1),
+                },
+                thread_id: Some(1),
+                frame: Some(GdbStoppedFrame {
+                    address: Some("0x001007d8".to_owned()),
+                    function: Some("main".to_owned()),
+                    file: Some(PathBuf::from("/project/main.c")),
+                    line: Some(7),
+                }),
+            }
+        );
     }
 
     #[test]
