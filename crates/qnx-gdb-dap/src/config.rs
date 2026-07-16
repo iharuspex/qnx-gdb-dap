@@ -15,6 +15,8 @@ pub struct LaunchArguments {
     /// QNX remote target in `HOST:PORT` form.
     pub target: String,
 
+    pub deployment: DeploymentArguments,
+
     /// Optional host-side working directory for GDB.
     #[serde(default)]
     pub working_directory: Option<PathBuf>,
@@ -42,13 +44,27 @@ pub struct DisconnectArguments {
     pub suspend_debuggee: bool,
 }
 
+/// Target deployment configuration.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "camelCase")]
+pub enum DeploymentArguments {
+    Upload {
+        #[serde(rename = "remoteProgram")]
+        remote_program: String,
+    },
+    Existing {
+        #[serde(rename = "remoteProgram")]
+        remote_program: String,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use serde_json::json;
 
-    use super::{DisconnectArguments, LaunchArguments};
+    use super::{DeploymentArguments, DisconnectArguments, LaunchArguments};
 
     #[test]
     fn deserializes_launch_arguments() {
@@ -56,6 +72,10 @@ mod tests {
             "gdb": "/opt/qnx650/host/linux/x86/usr/bin/ntoarm-gdb",
             "program": "/home/user/build/application",
             "target": "192.168.1.28:8080",
+            "deployment": {
+                "mode": "upload",
+                "remoteProgram": "/dev/shmem/application"
+            },
             "workingDirectory": "/home/user/project",
             "gdbArguments": [
                 "--quiet"
@@ -69,8 +89,32 @@ mod tests {
                 gdb: PathBuf::from("/opt/qnx650/host/linux/x86/usr/bin/ntoarm-gdb"),
                 program: PathBuf::from("/home/user/build/application"),
                 target: "192.168.1.28:8080".to_owned(),
+                deployment: DeploymentArguments::Upload {
+                    remote_program: ("/dev/shmem/application".to_owned())
+                },
                 working_directory: Some(PathBuf::from("/home/user/project")),
                 gdb_arguments: vec!["--quiet".to_owned()],
+            }
+        );
+    }
+
+    #[test]
+    fn deserializes_upload_deployment() {
+        let arguments: LaunchArguments = serde_json::from_value(json!({
+            "gdb": "ntoarm-gdb",
+            "program": "/local/application",
+            "target": "192.168.1.28:8080",
+            "deployment": {
+                "mode": "upload",
+                "remoteProgram": "/dev/shmem/application"
+            }
+        }))
+        .expect("launch arguments should deserialize");
+
+        assert_eq!(
+            arguments.deployment,
+            DeploymentArguments::Upload {
+                remote_program: "/dev/shmem/application".to_owned(),
             }
         );
     }
@@ -80,7 +124,11 @@ mod tests {
         let arguments: LaunchArguments = serde_json::from_value(json!({
             "gdb": "ntoarm-gdb",
             "program": "application",
-            "target": "localhost:8000"
+            "target": "localhost:8000",
+            "deployment": {
+                "mode": "upload",
+                "remoteProgram": "/dev/shmem/application"
+            }
         }))
         .expect("launch arguments should deserialize");
 

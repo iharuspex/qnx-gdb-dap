@@ -7,8 +7,8 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 use crate::{
-    GdbBreakpoint, GdbEvent, GdbProcess, GdbProcessConfig, GdbProcessError, MiRecord,
-    MiResultRecord, SourceBreakpoint, commands, find_result,
+    GdbBreakpoint, GdbDeployment, GdbDeploymentResult, GdbEvent, GdbProcess, GdbProcessConfig,
+    GdbProcessError, MiRecord, MiResultRecord, SourceBreakpoint, commands, find_result,
 };
 
 /// Configuration of a remote QNX debugging session.
@@ -22,6 +22,9 @@ pub struct GdbSessionConfig {
 
     /// QNX remote target in `HOST:PORT` form.
     pub target: String,
+
+    /// Method used to prepare the target executable.
+    pub deployment: GdbDeployment,
 
     /// Optional working directory for the GDB host process.
     pub working_directory: Option<PathBuf>,
@@ -37,11 +40,13 @@ impl GdbSessionConfig {
         gdb_executable: impl Into<PathBuf>,
         program: impl Into<PathBuf>,
         target: impl Into<String>,
+        deployment: GdbDeployment,
     ) -> Self {
         Self {
             gdb_executable: gdb_executable.into(),
             program: program.into(),
             target: target.into(),
+            deployment,
             working_directory: None,
             gdb_arguments: Vec::new(),
         }
@@ -77,6 +82,9 @@ pub enum GdbSessionState {
     /// GDB is connected to the QNX remote target.
     Connected,
 
+    /// The remote executable has been uploaded or selected.
+    Deployed,
+
     /// GDB has terminated.
     Terminated,
 }
@@ -95,6 +103,12 @@ pub struct GdbSessionOutput {
 
     /// Records emitted while connecting to the remote target.
     pub target_events: Vec<GdbEvent>,
+
+    /// Records emitted while preparing the target executable.
+    pub deployment_events: Vec<GdbEvent>,
+
+    /// Description of the prepared executable.
+    pub deployment: GdbDeploymentResult,
 }
 
 /// A configured remote QNX GDB session.
@@ -191,11 +205,17 @@ impl GdbSession {
             "QNX GDB session connected"
         );
 
+        let deployment_result = session.prepare_deployment()?;
+
+        session.state = GdbSessionState::Deployed;
+
         let output = GdbSessionOutput {
             startup_records,
             version_events: version_result.events,
             symbol_events: symbol_result.events,
             target_events: target_result.events,
+            deployment_events: deployment_result.0,
+            deployment: deployment_result.1,
         };
 
         Ok((session, output))
@@ -240,7 +260,7 @@ impl GdbSession {
         source: &Path,
         breakpoints: &[SourceBreakpoint],
     ) -> Result<Vec<GdbBreakpoint>, GdbSessionError> {
-        self.require_state("set source breakpoints", &[GdbSessionState::Connected])?;
+        self.require_state("set source breakpoints", &[GdbSessionState::Deployed])?;
 
         let source_text = path_to_utf8(source, "breakpoint source file")?;
 
@@ -331,6 +351,63 @@ impl GdbSession {
         })
     }
 
+    fn prepare_deployment(
+        &mut self,
+    ) -> Result<(Vec<GdbEvent>, GdbDeploymentResult), GdbSessionError> {
+        self.require_state("prepare deployment", &[GdbSessionState::Connected])?;
+
+        let local_program = path_to_utf8(&self.config.program, "program executable")?;
+
+        let deployment = self.config.deployment.clone();
+
+        let remote_program = deployment.remote_program();
+
+        validate_remote_program(remote_program)?;
+
+        let (result, uploaded) = match &self.config.deployment {
+            GdbDeployment::Upload { remote_program } => {
+                info!(
+                    local_program,
+                    remote_program, "uploading executable to QNX target"
+                );
+
+                (
+                    self.process.execute(|token| {
+                        commands::qnx_upload(token, local_program, remote_program)
+                    })?,
+                    true,
+                )
+            }
+
+            GdbDeployment::Existing { remote_program } => {
+                info!(remote_program, "selecting existing QNX target executable");
+
+                (
+                    self.process
+                        .execute(|token| commands::qnx_set_executable(token, remote_program))?,
+                    false,
+                )
+            }
+        };
+
+        let operation = if uploaded {
+            "upload"
+        } else {
+            "set nto-executable"
+        };
+
+        require_result_class(operation, &result.result, &["done"])?;
+
+        Ok((
+            result.events,
+            GdbDeploymentResult {
+                local_program: self.config.program.clone(),
+                remote_program: remote_program.to_owned(),
+                uploaded,
+            },
+        ))
+    }
+
     /// Returns mutable access to the low-level GDB process.
     ///
     /// This is temporarily exposed while higher-level session commands are
@@ -399,6 +476,20 @@ fn path_to_utf8<'a>(path: &'a Path, description: &'static str) -> Result<&'a str
         description,
         path: path.to_path_buf(),
     })
+}
+
+fn validate_remote_program(remote_program: &str) -> Result<(), GdbSessionError> {
+    if remote_program.trim().is_empty() {
+        return Err(GdbSessionError::EmptyRemoteProgram);
+    }
+
+    if remote_program.contains('\0') {
+        return Err(GdbSessionError::InvalidRemoteProgram {
+            remote_program: remote_program.to_owned(),
+        });
+    }
+
+    Ok(())
 }
 
 fn require_result_class(
@@ -547,6 +638,12 @@ pub enum GdbSessionError {
         actual: GdbSessionState,
         expected: Vec<GdbSessionState>,
     },
+
+    #[error("QNX remote program path must not be empty")]
+    EmptyRemoteProgram,
+
+    #[error("invalid QNX remote program path {remote_program:?}")]
+    InvalidRemoteProgram { remote_program: String },
 }
 
 #[cfg(test)]
@@ -557,18 +654,25 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use crate::{MiResult, MiResultRecord, MiValue};
+    use crate::{GdbDeployment, MiResult, MiResultRecord, MiValue};
 
     use super::{
         GdbSessionConfig, GdbSessionError, parse_breakpoint_result, require_result_class,
-        validate_config,
+        validate_config, validate_remote_program,
     };
 
     #[test]
     fn rejects_empty_target() {
         let temporary = TemporaryFiles::new();
 
-        let config = GdbSessionConfig::new(&temporary.gdb, &temporary.program, "");
+        let config = GdbSessionConfig::new(
+            &temporary.gdb,
+            &temporary.program,
+            "",
+            GdbDeployment::Existing {
+                remote_program: ("".to_owned()),
+            },
+        );
 
         let error = validate_config(&config).expect_err("empty target should fail");
 
@@ -583,6 +687,9 @@ mod tests {
             &temporary.gdb,
             &temporary.program,
             "192.168.1.20:8000 invalid",
+            GdbDeployment::Existing {
+                remote_program: ("".to_owned()),
+            },
         );
 
         let error = validate_config(&config).expect_err("target containing whitespace should fail");
@@ -743,6 +850,18 @@ mod tests {
             .expect_err("missing bkpt data should fail");
 
         assert!(matches!(error, GdbSessionError::MissingBreakpointData));
+    }
+
+    #[test]
+    fn rejects_empty_remote_program() {
+        let error = validate_remote_program("").expect_err("empty remote path should fail");
+
+        assert!(matches!(error, GdbSessionError::EmptyRemoteProgram));
+    }
+
+    #[test]
+    fn accepts_remote_program_with_spaces() {
+        validate_remote_program("/dev/shmem/my application").expect("spaces should be accepted");
     }
 
     struct TemporaryFiles {

@@ -1,7 +1,7 @@
 use std::{env, process::ExitCode};
 
 use anyhow::{Context, Result};
-use qnx_gdb_mi::{GdbEvent, GdbSession, GdbSessionConfig, MiRecord};
+use qnx_gdb_mi::{GdbDeployment, GdbEvent, GdbSession, GdbSessionConfig, MiRecord};
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
@@ -21,14 +21,23 @@ fn run() -> Result<()> {
     let arguments = env::args().collect::<Vec<_>>();
 
     if arguments.len() != 4 {
-        anyhow::bail!("usage: {} <ntoarm-gdb> <program> <host:port>", arguments[0]);
+        anyhow::bail!(
+            "usage: {} <ntoarm-gdb> <program> <host:port> <remote-program>",
+            arguments[0]
+        );
     }
 
     let gdb_path = &arguments[1];
     let program = &arguments[2];
     let target = &arguments[3];
+    let remote_program = &arguments[4];
 
-    let config = GdbSessionConfig::new(gdb_path, program, target);
+    let config = GdbSessionConfig::new(
+        gdb_path,
+        program,
+        target,
+        GdbDeployment::existing(remote_program),
+    );
 
     let (mut session, output) = GdbSession::connect(config)
         .with_context(|| format!("failed to connect GDB to target {target}"))?;

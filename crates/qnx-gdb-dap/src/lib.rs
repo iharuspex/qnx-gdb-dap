@@ -8,4 +8,4 @@ mod config;
 
 pub use adapter::{AdapterState, DebugAdapter};
 pub use breakpoints::{DapBreakpoint, DapSource, DapSourceBreakpoint, SetBreakpointsArguments};
-pub use config::{DisconnectArguments, LaunchArguments};
+pub use config::{DeploymentArguments, DisconnectArguments, LaunchArguments};

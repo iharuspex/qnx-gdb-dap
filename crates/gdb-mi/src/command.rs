@@ -220,6 +220,48 @@ pub mod commands {
         command
     }
 
+    /// Creates a QNX GDB command that uploads a local executable to the target.
+    #[must_use]
+    pub fn qnx_upload(token: u64, local_program: &str, remote_program: &str) -> MiCommand {
+        let command = format!(
+            "upload {} {}",
+            quote_console_argument(local_program),
+            quote_console_argument(remote_program),
+        );
+
+        interpreter_exec_console(token, &command)
+    }
+
+    /// Creates a QNX GDB command that selects an existing target executable.
+    #[must_use]
+    pub fn qnx_set_executable(token: u64, remote_program: &str) -> MiCommand {
+        let command = format!(
+            "set nto-executable {}",
+            quote_console_argument(remote_program),
+        );
+
+        interpreter_exec_console(token, &command)
+    }
+
+    fn quote_console_argument(value: &str) -> String {
+        let mut output = String::with_capacity(value.len() + 2);
+        output.push('"');
+
+        for character in value.chars() {
+            match character {
+                '\\' => output.push_str("\\\\"),
+                '"' => output.push_str("\\\""),
+                '\n' => output.push_str("\\n"),
+                '\r' => output.push_str("\\r"),
+                '\t' => output.push_str("\\t"),
+                other => output.push(other),
+            }
+        }
+
+        output.push('"');
+        output
+    }
+
     /// Creates `-exec-run`.
     #[must_use]
     pub fn exec_run(token: u64) -> MiCommand {
@@ -479,6 +521,37 @@ mod tests {
                 .encode()
                 .expect("command should encode"),
             "3-stack-list-arguments 1"
+        );
+    }
+
+    #[test]
+    fn creates_qnx_upload_command() {
+        let command =
+            commands::qnx_upload(4, "/home/user/build/application", "/dev/shmem/application");
+
+        assert_eq!(
+            command.encode().expect("command should encode"),
+            r#"4-interpreter-exec console "upload \"/home/user/build/application\" \"/dev/shmem/application\"""#
+        );
+    }
+
+    #[test]
+    fn creates_qnx_set_executable_command() {
+        let command = commands::qnx_set_executable(5, "/opt/application/bin/app");
+
+        assert_eq!(
+            command.encode().expect("command should encode"),
+            r#"5-interpreter-exec console "set nto-executable \"/opt/application/bin/app\"""#
+        );
+    }
+
+    #[test]
+    fn quotes_console_paths_containing_spaces() {
+        let command = commands::qnx_upload(1, "/home/user/my project/app", "/dev/shmem/my app");
+
+        assert_eq!(
+            command.encode().expect("command should encode"),
+            r#"1-interpreter-exec console "upload \"/home/user/my project/app\" \"/dev/shmem/my app\"""#
         );
     }
 

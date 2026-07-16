@@ -1,7 +1,7 @@
 use std::{env, path::Path, process::ExitCode};
 
 use anyhow::{Context, Result, bail};
-use qnx_gdb_mi::{GdbSession, GdbSessionConfig, SourceBreakpoint};
+use qnx_gdb_mi::{GdbDeployment, GdbSession, GdbSessionConfig, SourceBreakpoint};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -23,7 +23,7 @@ fn run() -> Result<()> {
     if arguments.len() < 6 {
         bail!(
             "usage: {} <ntoarm-gdb> <program> <host:port> \
-            <source_file> <line> [line...]",
+            <remote-program> <source_file> <line> [line...]",
             arguments[0]
         );
     }
@@ -31,9 +31,10 @@ fn run() -> Result<()> {
     let gdb_path = &arguments[1];
     let program = &arguments[2];
     let target = &arguments[3];
-    let source = Path::new(&arguments[4]);
+    let remote_program = &arguments[4];
+    let source = Path::new(&arguments[5]);
 
-    let breakpoints = arguments[5..]
+    let breakpoints = arguments[6..]
         .iter()
         .map(|line| {
             line.parse::<u64>()
@@ -42,7 +43,12 @@ fn run() -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let config = GdbSessionConfig::new(gdb_path, program, target);
+    let config = GdbSessionConfig::new(
+        gdb_path,
+        program,
+        target,
+        GdbDeployment::upload(remote_program),
+    );
 
     let (mut session, _) = GdbSession::connect(config)?;
 

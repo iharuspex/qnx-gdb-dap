@@ -1,10 +1,14 @@
 use std::io::{BufRead, Write};
 
-use crate::{DapBreakpoint, DisconnectArguments, LaunchArguments, SetBreakpointsArguments};
+use crate::{
+    DapBreakpoint, DeploymentArguments, DisconnectArguments, LaunchArguments,
+    SetBreakpointsArguments,
+};
 use anyhow::Result;
 use qnx_dap::{DapReader, DapWriter, Event, OutgoingMessage, Request, Response};
 use qnx_gdb_mi::{
-    GdbEvent, GdbSession, GdbSessionConfig, GdbSessionOutput, MiRecord, SourceBreakpoint,
+    GdbDeployment, GdbEvent, GdbSession, GdbSessionConfig, GdbSessionOutput, MiRecord,
+    SourceBreakpoint,
 };
 use serde_json::json;
 use tracing::{debug, info, warn};
@@ -477,7 +481,20 @@ impl DebugAdapter {
     }
 
     fn create_session(&self, arguments: LaunchArguments) -> Result<(GdbSession, GdbSessionOutput)> {
-        let mut config = GdbSessionConfig::new(arguments.gdb, arguments.program, arguments.target);
+        let deployment = match arguments.deployment {
+            DeploymentArguments::Upload { remote_program } => GdbDeployment::upload(remote_program),
+
+            DeploymentArguments::Existing { remote_program } => {
+                GdbDeployment::Existing { remote_program }
+            }
+        };
+
+        let mut config = GdbSessionConfig::new(
+            arguments.gdb,
+            arguments.program,
+            arguments.target,
+            deployment,
+        );
 
         if let Some(working_directory) = arguments.working_directory {
             config = config.working_directory(working_directory);
@@ -508,6 +525,17 @@ impl DebugAdapter {
         for event in &output.target_events {
             log_gdb_event("target", event);
         }
+
+        for event in &output.deployment_events {
+            log_gdb_event("deployment", event);
+        }
+
+        debug!(
+            local_program = %output.deployment.local_program.display(),
+            remote_program = %output.deployment.remote_program,
+            uploaded = output.deployment.uploaded,
+            "QNX executable prepared"
+        );
     }
 
     fn send_success_response<W>(
