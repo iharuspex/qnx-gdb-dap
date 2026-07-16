@@ -23,7 +23,8 @@ pub use breakpoint::{GdbBreakpoint, SourceBreakpoint};
 pub use command::{MiCommand, MiTokenGenerator, commands};
 pub use parser::{MiParseError, parse_record};
 pub use process::{
-    GdbCommandResult, GdbEvent, GdbProcess, GdbProcessConfig, GdbProcessError, is_gdb_file,
+    GdbCommandResult, GdbEvent, GdbExecutionEvent, GdbExecutionStart, GdbProcess, GdbProcessConfig,
+    GdbProcessError, GdbReaderError, GdbRecordPoll, is_gdb_file,
 };
 pub use record::{MiAsyncRecord, MiRecord, MiResultRecord};
 pub use session::{

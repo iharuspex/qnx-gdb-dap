@@ -2,6 +2,8 @@ use std::{
     io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
+    sync::mpsc::{self, Receiver, RecvError, Sender, TryRecvError},
+    thread::{self, JoinHandle},
 };
 
 use thiserror::Error;
@@ -61,6 +63,22 @@ pub enum GdbEvent {
     Stream(MiRecord),
 }
 
+/// A record received after an execution command was initially accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GdbExecutionEvent {
+    /// GDB reported asynchronous execution state.
+    Async(MiRecord),
+
+    /// Console, target or diagnostic output.
+    Stream(MiRecord),
+
+    /// A later result record, including a possible late `^error`.
+    Result(MiResultRecord),
+
+    /// GDB prompt.
+    Prompt,
+}
+
 /// Result of one GDB/MI command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GdbCommandResult {
@@ -89,12 +107,104 @@ impl GdbCommandResult {
     }
 }
 
+#[derive(Debug)]
+enum GdbReaderMessage {
+    Record(MiRecord),
+    Error(GdbReaderError),
+    EndOfFile,
+}
+
+/// Error produced by the GDB stdout reader thread
+#[derive(Debug, Error)]
+pub enum GdbReaderError {
+    #[error("I/O error while reading GDB output")]
+    Io(#[from] std::io::Error),
+
+    #[error("invalid GDB/MI output")]
+    Parse(#[from] MiParseError),
+}
+
+/// Initial result of an asynchronous execution command.
+///
+/// A result class of `running` means GDB accepted the command. Execution
+/// events such as `*stopped` must then be read separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GdbExecutionStart {
+    /// Token assigned to the execution command.
+    pub token: u64,
+
+    /// Initial result record, normally `^running` or `^error`.
+    pub result: MiResultRecord,
+
+    /// Records received before the initial result.
+    pub events: Vec<GdbEvent>,
+}
+
+impl GdbExecutionStart {
+    /// Returns whether GDB accepted the command for execution.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.result.class == "running"
+    }
+
+    /// Returns an error message from an initial `^error` result.
+    #[must_use]
+    pub fn error_message(&self) -> Option<&str> {
+        if self.result.class != "error" {
+            return None;
+        }
+
+        find_result(&self.result.results, "msg")?.as_const()
+    }
+}
+
+fn run_reader_thread(stdout: ChildStdout, sender: &Sender<GdbReaderMessage>) {
+    let mut reader = BufReader::new(stdout);
+
+    loop {
+        let mut line = String::new();
+
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                let _ = sender.send(GdbReaderMessage::EndOfFile);
+                return;
+            }
+
+            Ok(_) => {
+                let line = line.trim_end_matches(['\r', '\n']);
+
+                trace!(line = %line, "received GDB/MI line");
+
+                match parse_record(line) {
+                    Ok(record) => {
+                        if sender.send(GdbReaderMessage::Record(record)).is_err() {
+                            return;
+                        }
+                    }
+
+                    Err(error) => {
+                        let _ = sender.send(GdbReaderMessage::Error(GdbReaderError::Parse(error)));
+                        return;
+                    }
+                }
+            }
+
+            Err(error) => {
+                let _ = sender.send(GdbReaderMessage::Error(GdbReaderError::Io(error)));
+                return;
+            }
+        }
+    }
+}
+
 /// A long-running GDB process communicating through GDB/MI.
 #[derive(Debug)]
 pub struct GdbProcess {
     child: Child,
     stdin: Option<BufWriter<ChildStdin>>,
-    stdout: BufReader<ChildStdout>,
+    // stdout: BufReader<ChildStdout>,
+    records: Receiver<GdbReaderMessage>,
+    reader_thread: Option<JoinHandle<()>>,
     tokens: MiTokenGenerator,
     synchronized: bool,
     terminated: bool,
@@ -136,10 +246,21 @@ impl GdbProcess {
 
         let stdout = child.stdout.take().ok_or(GdbProcessError::MissingStdout)?;
 
+        let (record_sender, record_receiver) = mpsc::channel();
+
+        let reader_thread = thread::Builder::new()
+            .name("qnx-gdb-mi-reader".to_owned())
+            .spawn(move || {
+                run_reader_thread(stdout, &record_sender);
+            })
+            .map_err(GdbProcessError::ReaderThreadSpawn)?;
+
         Ok(Self {
             child,
             stdin: Some(BufWriter::new(stdin)),
-            stdout: BufReader::new(stdout),
+            // stdout: BufReader::new(stdout),
+            records: record_receiver,
+            reader_thread: Some(reader_thread),
             tokens: MiTokenGenerator::new(),
             synchronized: false,
             terminated: false,
@@ -170,7 +291,7 @@ impl GdbProcess {
         let mut startup_records = Vec::new();
 
         loop {
-            let Some(record) = self.read_record()? else {
+            let Some(record) = self.next_record()? else {
                 let status = self.child.try_wait()?;
 
                 return Err(GdbProcessError::UnexpectedEndDuringSynchronization { status });
@@ -240,6 +361,77 @@ impl GdbProcess {
         self.wait_for_result(token)
     }
 
+    /// Sends an execution command and waits only for its initial result.
+    ///
+    /// Normally GDB returns `^running`, after which execution continues
+    /// asynchronously. Later records such as `*stopped` must be consumed through
+    /// [`GdbProcess::next_record`] or [`GdbProcess::try_next_record`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command cannot be written, GDB terminates, or an
+    /// unexpected result token is received.
+    pub fn start_execution<F>(
+        &mut self,
+        build_command: F,
+    ) -> Result<GdbExecutionStart, GdbProcessError>
+    where
+        F: FnOnce(u64) -> MiCommand,
+    {
+        let token = self.tokens.next_token();
+        let command = build_command(token);
+
+        if command.token() != Some(token) {
+            return Err(GdbProcessError::UnexpectedCommandToken {
+                expected: token,
+                actual: command.token(),
+            });
+        }
+
+        self.send_command(&command)?;
+
+        let mut events = Vec::new();
+
+        loop {
+            let Some(record) = self.next_record()? else {
+                let status = self.child.try_wait()?;
+
+                return Err(GdbProcessError::UnexpectedEndOfOutput {
+                    status,
+                    expected_token: token,
+                });
+            };
+
+            match record {
+                MiRecord::Result(result) if result.token == Some(token) => {
+                    return Ok(GdbExecutionStart {
+                        token,
+                        result,
+                        events,
+                    });
+                }
+
+                MiRecord::Result(result) => {
+                    return Err(GdbProcessError::UnexpectedResultToken {
+                        expected: token,
+                        actual: result.token,
+                        class: result.class,
+                    });
+                }
+
+                MiRecord::ExecAsync(_) | MiRecord::StatusAsync(_) | MiRecord::NotifyAsync(_) => {
+                    events.push(GdbEvent::Async(record));
+                }
+
+                MiRecord::ConsoleStream(_) | MiRecord::TargetStream(_) | MiRecord::LogStream(_) => {
+                    events.push(GdbEvent::Stream(record));
+                }
+
+                MiRecord::Prompt | MiRecord::Empty => {}
+            }
+        }
+    }
+
     /// Sends an already constructed command.
     ///
     /// This method does not wait for a result record.
@@ -264,28 +456,66 @@ impl GdbProcess {
         Ok(())
     }
 
-    /// Reads one record from GDB.
+    /// Waits for the next GDB/MI record.
     ///
-    /// Returns `Ok(None)` if GDB closes its stdout.
+    /// Returns `Ok(None)` when GDB closes its output.
     ///
     /// # Errors
     ///
-    /// Returns an error if reading or parsing fails.
-    pub fn read_record(&mut self) -> Result<Option<MiRecord>, GdbProcessError> {
-        let mut line = String::new();
-        let bytes_read = self.stdout.read_line(&mut line)?;
-
-        if bytes_read == 0 {
-            return Ok(None);
+    /// Returns an error if the reader thread reports an I/O or parsing failure,
+    /// or if its communication channel closes unexpectedly.
+    pub fn next_record(&mut self) -> Result<Option<MiRecord>, GdbProcessError> {
+        match self.records.recv() {
+            Ok(GdbReaderMessage::Record(record)) => Ok(Some(record)),
+            Ok(GdbReaderMessage::EndOfFile) => Ok(None),
+            Ok(GdbReaderMessage::Error(error)) => Err(GdbProcessError::Reader(error)),
+            Err(error) => Err(GdbProcessError::ReaderChannelClosed(error)),
         }
+    }
 
-        let line = line.trim_end_matches(['\r', '\n']);
+    /// Attempts to receive a GDB/MI record without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reader thread failed or its channel has closed.
+    pub fn try_next_record(&mut self) -> Result<GdbRecordPoll, GdbProcessError> {
+        match self.records.try_recv() {
+            Ok(GdbReaderMessage::Record(record)) => Ok(GdbRecordPoll::Record(record)),
+            Ok(GdbReaderMessage::EndOfFile) => Ok(GdbRecordPoll::EndOfFile),
+            Ok(GdbReaderMessage::Error(error)) => Err(GdbProcessError::Reader(error)),
+            Err(TryRecvError::Empty) => Ok(GdbRecordPoll::Pending),
+            Err(TryRecvError::Disconnected) => Err(GdbProcessError::ReaderChannelDisconnected),
+        }
+    }
 
-        trace!(line = %line, "received GDB/MI line");
+    /// Waits for one record produced after an execution command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if GDB output cannot be read.
+    pub fn next_execution_event(&mut self) -> Result<Option<GdbExecutionEvent>, GdbProcessError> {
+        loop {
+            let Some(record) = self.next_record()? else {
+                return Ok(None);
+            };
 
-        let record = parse_record(line)?;
+            let event = match record {
+                MiRecord::Result(result) => GdbExecutionEvent::Result(result),
 
-        Ok(Some(record))
+                MiRecord::ExecAsync(_) | MiRecord::StatusAsync(_) | MiRecord::NotifyAsync(_) => {
+                    GdbExecutionEvent::Async(record)
+                }
+
+                MiRecord::ConsoleStream(_) | MiRecord::TargetStream(_) | MiRecord::LogStream(_) => {
+                    GdbExecutionEvent::Stream(record)
+                }
+
+                MiRecord::Prompt => GdbExecutionEvent::Prompt,
+                MiRecord::Empty => continue,
+            };
+
+            return Ok(Some(event));
+        }
     }
 
     /// Requests a clean GDB shutdown and waits for process termination.
@@ -310,9 +540,20 @@ impl GdbProcess {
 
         self.stdin.take();
         let status = self.child.wait().map_err(GdbProcessError::Wait)?;
+        self.join_reader_thread();
         self.terminated = true;
 
         Ok(status)
+    }
+
+    fn join_reader_thread(&mut self) {
+        let Some(handle) = self.reader_thread.take() else {
+            return;
+        };
+
+        if handle.join().is_err() {
+            warn!("GDB reader thread panicked");
+        }
     }
 
     fn wait_for_result(
@@ -322,7 +563,7 @@ impl GdbProcess {
         let mut events = Vec::new();
 
         loop {
-            let Some(record) = self.read_record()? else {
+            let Some(record) = self.next_record()? else {
                 let status = self.child.try_wait()?;
 
                 return Err(GdbProcessError::UnexpectedEndOfOutput {
@@ -368,6 +609,7 @@ impl Drop for GdbProcess {
 
         match self.child.try_wait() {
             Ok(Some(_)) => {
+                self.join_reader_thread();
                 self.terminated = true;
             }
             Ok(None) => {
@@ -392,6 +634,7 @@ impl Drop for GdbProcess {
                     );
                 }
 
+                self.join_reader_thread();
                 self.terminated = true;
             }
             Err(error) => {
@@ -403,6 +646,19 @@ impl Drop for GdbProcess {
             }
         }
     }
+}
+
+/// Result of polling the GDB record channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GdbRecordPoll {
+    /// One record is available.
+    Record(MiRecord),
+
+    /// No record is currently available.
+    Pending,
+
+    /// GDB closed its stdout.
+    EndOfFile,
 }
 
 /// Error produced while managing the GDB process.
@@ -471,6 +727,18 @@ pub enum GdbProcessError {
          token={token:?}, class={class:?}"
     )]
     UnexpectedResultDuringSynchronization { token: Option<u64>, class: String },
+
+    #[error("failed to start GDB stdout reader thread")]
+    ReaderThreadSpawn(#[source] std::io::Error),
+
+    #[error("GDB stdout reader failed")]
+    Reader(#[from] GdbReaderError),
+
+    #[error("GDB stdout reader channel closed unexpectedly")]
+    ReaderChannelClosed(#[source] RecvError),
+
+    #[error("GDB stdout reader channel disconnected")]
+    ReaderChannelDisconnected,
 }
 
 /// Returns whether a path appears to be executable.
