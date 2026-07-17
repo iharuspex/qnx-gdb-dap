@@ -9,9 +9,9 @@ use tracing::{debug, info};
 use crate::{
     GdbBreakpoint, GdbDeployment, GdbDeploymentResult, GdbDisconnectMode, GdbEvent,
     GdbExecutionEvent, GdbExecutionPoll, GdbProcess, GdbProcessConfig, GdbProcessError,
-    GdbRunStarted, GdbSessionEvent, GdbSessionEventPoll, GdbShutdownResult, GdbStopReason,
-    GdbStoppedFrame, MiAsyncRecord, MiRecord, MiResult, MiResultRecord, SourceBreakpoint, commands,
-    find_result,
+    GdbRunStarted, GdbSessionEvent, GdbSessionEventPoll, GdbShutdownResult, GdbStackFrame,
+    GdbStopReason, GdbStoppedFrame, GdbThread, MiAsyncRecord, MiListItem, MiRecord, MiResult,
+    MiResultRecord, MiValue, SourceBreakpoint, commands, find_result,
 };
 
 /// Configuration of a remote QNX debugging session.
@@ -437,6 +437,61 @@ impl GdbSession {
 
             return Ok(GdbSessionEventPoll::Event(event));
         }
+    }
+
+    /// Returns threads currently known to GDB.
+    ///
+    /// This operation is valid only while the inferior is stopped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session is not stopped, GDB rejects the command,
+    /// or the response has an invalid structure.
+    pub fn threads(&mut self) -> Result<Vec<GdbThread>, GdbSessionError> {
+        self.require_state("list threads", &[GdbSessionState::Stopped])?;
+
+        let result = self.process.execute(commands::thread_list_ids)?;
+
+        require_result_class("thread-list-ids", &result.result, &["done"])?;
+
+        parse_thread_list(&result.result)
+    }
+
+    /// Returns a range of stack frames for one stopped thread.
+    ///
+    /// The initial QNX implementation assumes the thread from the preceding
+    /// `stopped` event is already selected by GDB.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session is not stopped, GDB rejects the command,
+    /// or the response has an invalid structure.
+    pub fn stack_frames(
+        &mut self,
+        _thread_id: u64,
+        start_frame: u64,
+        levels: u64,
+    ) -> Result<Vec<GdbStackFrame>, GdbSessionError> {
+        self.require_state("list stack frames", &[GdbSessionState::Stopped])?;
+
+        if levels == 0 {
+            return Ok(Vec::new());
+        }
+
+        let high_frame = start_frame.checked_add(levels - 1).ok_or_else(|| {
+            GdbSessionError::InvalidResponse {
+                operation: "stack-list-frames",
+                message: "requested frame range overflows u64".to_owned(),
+            }
+        })?;
+
+        let result = self
+            .process
+            .execute(|token| commands::stack_list_frames(token, start_frame, high_frame))?;
+
+        require_result_class("stack-list-frames", &result.result, &["done"])?;
+
+        parse_stack_frames(&result.result)
     }
 
     fn convert_execution_event(
@@ -1097,6 +1152,187 @@ fn find_tuple_const<'a>(results: &'a [crate::MiResult], name: &str) -> Option<&'
     find_result(results, name)?.as_const()
 }
 
+fn parse_thread_list(result: &MiResultRecord) -> Result<Vec<GdbThread>, GdbSessionError> {
+    let current_thread_id = find_result(&result.results, "current-thread-id")
+        .and_then(MiValue::as_const)
+        .and_then(parse_u64);
+
+    let thread_ids = find_result(&result.results, "thread-ids").ok_or_else(|| {
+        GdbSessionError::InvalidResponse {
+            operation: "thread-list-ids",
+            message: "missing thread-ids result".to_owned(),
+        }
+    })?;
+
+    let tuple = thread_ids
+        .as_tuple()
+        .ok_or_else(|| GdbSessionError::InvalidResponse {
+            operation: "thread-list-ids",
+            message: "thread-ids is not a tuple".to_owned(),
+        })?;
+
+    let mut threads = Vec::new();
+
+    for item in tuple {
+        if item.variable != "thread-id" {
+            continue;
+        }
+
+        let id_text = item
+            .value
+            .as_const()
+            .ok_or_else(|| GdbSessionError::InvalidResponse {
+                operation: "thread-list-ids",
+                message: "thread-id is not a constant".to_owned(),
+            })?;
+
+        let id = parse_u64(id_text).ok_or_else(|| GdbSessionError::InvalidResponse {
+            operation: "thread-list-ids",
+            message: format!("invalid thread identifier: {id_text}"),
+        })?;
+
+        threads.push(GdbThread {
+            id,
+            name: format!("Thread {id}"),
+            current: current_thread_id == Some(id),
+        });
+    }
+
+    Ok(threads)
+}
+
+// fn parse_stack_frames(result: &MiResultRecord) -> Result<Vec<GdbStackFrame>, GdbSessionError> {
+//     let stack =
+//         find_result(&result.results, "stack").ok_or_else(|| GdbSessionError::InvalidResponse {
+//             operation: "stack-list-frames",
+//             message: "missing stack result".to_owned(),
+//         })?;
+
+//     let entries = stack
+//         .as_list()
+//         .ok_or_else(|| GdbSessionError::InvalidResponse {
+//             operation: "stack-list-frames",
+//             message: "stack is not a list".to_owned(),
+//         })?;
+
+//     let mut frames = Vec::new();
+
+//     for entry in entries {
+//         let frame_value = match entry {
+//             MiValue::Result(result) if result.variable == "frame" => &result.value,
+
+//             MiValue::Tuple(_) => entry,
+
+//             _ => continue,
+//         };
+
+//         let fields = frame_value
+//             .as_tuple()
+//             .ok_or_else(|| GdbSessionError::InvalidResponse {
+//                 operation: "stack-list-frames",
+//                 message: "stack frame is not a tuple".to_owned(),
+//             })?;
+
+//         frames.push(parse_stack_frame(fields)?);
+//     }
+
+//     Ok(frames)
+// }
+
+fn parse_stack_frames(result: &MiResultRecord) -> Result<Vec<GdbStackFrame>, GdbSessionError> {
+    let stack =
+        find_result(&result.results, "stack").ok_or_else(|| GdbSessionError::InvalidResponse {
+            operation: "stack-list-frames",
+            message: "missing stack result".to_owned(),
+        })?;
+
+    let entries = stack
+        .as_list()
+        .ok_or_else(|| GdbSessionError::InvalidResponse {
+            operation: "stack-list-frames",
+            message: "stack is not a list".to_owned(),
+        })?;
+
+    let mut frames = Vec::new();
+
+    for entry in entries {
+        let MiListItem::Result(frame_result) = entry else {
+            continue;
+        };
+
+        if frame_result.variable != "frame" {
+            continue;
+        }
+
+        let fields =
+            frame_result
+                .value
+                .as_tuple()
+                .ok_or_else(|| GdbSessionError::InvalidResponse {
+                    operation: "stack-list-frames",
+                    message: "frame value is not a tuple".to_owned(),
+                })?;
+
+        frames.push(parse_stack_frame(fields)?);
+    }
+
+    Ok(frames)
+}
+
+fn parse_stack_frame(fields: &[MiResult]) -> Result<GdbStackFrame, GdbSessionError> {
+    let level_text = required_const_field("stack-list-frames", fields, "level")?;
+
+    let level = parse_u64(level_text).ok_or_else(|| GdbSessionError::InvalidResponse {
+        operation: "stack-list-frames",
+        message: format!("invalid stack frame level: {level_text}"),
+    })?;
+
+    let address = optional_const_field(fields, "addr").and_then(parse_address);
+
+    let function = optional_const_field(fields, "func").map(ToOwned::to_owned);
+
+    let file = optional_const_field(fields, "file").map(PathBuf::from);
+
+    let fullname = optional_const_field(fields, "fullname").map(PathBuf::from);
+
+    let line = optional_const_field(fields, "line").and_then(parse_u64);
+
+    Ok(GdbStackFrame {
+        level,
+        address,
+        function,
+        file,
+        fullname,
+        line,
+    })
+}
+
+fn required_const_field<'a>(
+    operation: &'static str,
+    fields: &'a [MiResult],
+    name: &str,
+) -> Result<&'a str, GdbSessionError> {
+    optional_const_field(fields, name).ok_or_else(|| GdbSessionError::InvalidResponse {
+        operation,
+        message: format!("missing {name} field"),
+    })
+}
+
+fn optional_const_field<'a>(fields: &'a [MiResult], name: &str) -> Option<&'a str> {
+    find_result(fields, name).and_then(MiValue::as_const)
+}
+
+fn parse_u64(value: &str) -> Option<u64> {
+    value.parse().ok()
+}
+
+fn parse_address(value: &str) -> Option<u64> {
+    value
+        .strip_prefix("0x")
+        .and_then(|digits| u64::from_str_radix(digits, 16).ok())
+        .or_else(|| value.parse().ok())
+}
+
 /// Error produced while configuring or managing a GDB session.
 #[derive(Debug, Error)]
 pub enum GdbSessionError {
@@ -1162,6 +1398,12 @@ pub enum GdbSessionError {
 
     #[error("invalid QNX remote program path {remote_program:?}")]
     InvalidRemoteProgram { remote_program: String },
+
+    #[error("invalid GDB response for {operation}: {message}")]
+    InvalidResponse {
+        operation: &'static str,
+        message: String,
+    },
 }
 
 #[cfg(test)]

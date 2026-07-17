@@ -15,6 +15,7 @@ mod breakpoint;
 mod command;
 mod deployment;
 mod execution;
+mod inspection;
 mod parser;
 mod process;
 mod record;
@@ -28,6 +29,7 @@ pub use deployment::{GdbDeployment, GdbDeploymentResult};
 pub use execution::{
     GdbRunStarted, GdbSessionEvent, GdbSessionEventPoll, GdbStopReason, GdbStoppedFrame,
 };
+pub use inspection::{GdbStackFrame, GdbThread};
 pub use parser::{MiParseError, parse_record};
 pub use process::{
     GdbCommandResult, GdbEvent, GdbExecutionEvent, GdbExecutionPoll, GdbExecutionStart, GdbProcess,

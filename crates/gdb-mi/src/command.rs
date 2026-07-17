@@ -298,10 +298,21 @@ pub mod commands {
         MiCommand::new("exec-interrupt").with_token(token)
     }
 
-    /// Creates `-stack-list-frames`.
+    /// Creates `-thread-list-ids`.
     #[must_use]
-    pub fn stack_list_frames(token: u64) -> MiCommand {
-        MiCommand::new("stack-list-frames").with_token(token)
+    pub fn thread_list_ids(token: u64) -> MiCommand {
+        MiCommand::new("thread-list-ids").with_token(token)
+    }
+
+    /// Creates `-stack-list-frames`.
+    ///
+    /// `low_frame` and `high_frame` are inclusive GDB frame levels.
+    #[must_use]
+    pub fn stack_list_frames(token: u64, low_frame: u64, high_frame: u64) -> MiCommand {
+        MiCommand::new("stack-list-frames")
+            .with_token(token)
+            .raw_argument(low_frame.to_string())
+            .raw_argument(high_frame.to_string())
     }
 
     /// Creates `-stack-list-locals PRINT_VALUES`.
@@ -525,12 +536,22 @@ mod tests {
     }
 
     #[test]
+    fn creates_thread_list_ids_command() {
+        let command = commands::thread_list_ids(11);
+
+        assert_eq!(
+            command.encode().expect("command should encode"),
+            "11-thread-list-ids"
+        );
+    }
+
+    #[test]
     fn creates_stack_commands() {
         assert_eq!(
-            commands::stack_list_frames(1)
+            commands::stack_list_frames(12, 0, 19)
                 .encode()
                 .expect("command should encode"),
-            "1-stack-list-frames"
+            "12-stack-list-frames 0 19"
         );
 
         assert_eq!(
