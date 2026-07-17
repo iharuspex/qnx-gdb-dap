@@ -139,7 +139,7 @@ if stopped:
         "type": "request",
         "command": "disconnect",
         "arguments": {
-            "terminateDebuggee": False,
+            "terminateDebuggee": True,
         },
     })
 

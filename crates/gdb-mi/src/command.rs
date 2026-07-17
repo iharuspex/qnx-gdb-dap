@@ -355,6 +355,30 @@ pub mod commands {
             .raw_argument("console")
             .string_argument(console_command)
     }
+
+    /// Creates `-gdb-set confirm off`.
+    #[must_use]
+    pub fn gdb_set_confirm_off(token: u64) -> MiCommand {
+        MiCommand::new("gdb-set")
+            .with_token(token)
+            .raw_argument("confirm")
+            .raw_argument("off")
+    }
+
+    /// Creates a QNX-compatible detach command.
+    ///
+    /// QNX GDB 6.8 does not reliably implement all modern MI target commands,
+    /// so detaching is performed through the GDB console.
+    #[must_use]
+    pub fn target_detach(token: u64) -> MiCommand {
+        interpreter_exec_console(token, "detach")
+    }
+
+    /// Creates a QNX-compatible inferior kill command.
+    #[must_use]
+    pub fn kill_inferior(token: u64) -> MiCommand {
+        interpreter_exec_console(token, "kill")
+    }
 }
 
 #[cfg(test)]
@@ -592,6 +616,36 @@ mod tests {
         assert_eq!(
             command.encode().expect("command should encode"),
             r#"12-interpreter-exec console "info threads""#
+        );
+    }
+
+    #[test]
+    fn creates_disable_confirmation_command() {
+        let command = commands::gdb_set_confirm_off(1);
+
+        assert_eq!(
+            command.encode().expect("command should encode"),
+            "1-gdb-set confirm off"
+        );
+    }
+
+    #[test]
+    fn creates_target_detach_command() {
+        let command = commands::target_detach(2);
+
+        assert_eq!(
+            command.encode().expect("command should encode"),
+            r#"2-interpreter-exec console "detach""#
+        );
+    }
+
+    #[test]
+    fn creates_kill_inferior_command() {
+        let command = commands::kill_inferior(3);
+
+        assert_eq!(
+            command.encode().expect("command should encode"),
+            r#"3-interpreter-exec console "kill""#
         );
     }
 }

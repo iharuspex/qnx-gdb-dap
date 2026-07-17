@@ -501,6 +501,29 @@ impl GdbProcess {
         }
     }
 
+    /// Drains all GDB records currently available without blocking.
+    ///
+    /// The method stops when the channel is empty or GDB reports EOF.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reader thread reports an I/O or parsing failure.
+    pub fn drain_records(&mut self) -> Result<Vec<MiRecord>, GdbProcessError> {
+        let mut records = Vec::new();
+
+        loop {
+            match self.try_next_record()? {
+                GdbRecordPoll::Record(record) => {
+                    records.push(record);
+                }
+
+                GdbRecordPoll::Pending | GdbRecordPoll::EndOfFile => {
+                    return Ok(records);
+                }
+            }
+        }
+    }
+
     /// Waits for one record produced after an execution command.
     ///
     /// # Errors
@@ -575,14 +598,14 @@ impl GdbProcess {
     ///
     /// # Errors
     ///
-    /// Returns an error if `-gdb-exit` cannot be sent or the child process
-    /// cannot be waited for.
+    /// Returns an error if `-gdb-exit` cannot be sent or GDB cannot be waited
+    /// for.
     pub fn shutdown(&mut self) -> Result<ExitStatus, GdbProcessError> {
         if self.terminated {
             return self.child.wait().map_err(GdbProcessError::Wait);
         }
 
-        let result = self.execute(commands::gdb_exit)?;
+        let result = self.request_exit()?;
 
         if result.result.class != "exit" {
             warn!(
@@ -591,7 +614,38 @@ impl GdbProcess {
             );
         }
 
+        self.wait_for_exit()
+    }
+
+    /// Requests a clean GDB shutdown.
+    ///
+    /// The method waits for the `^exit` result but does not wait for the child
+    /// process itself. Records produced after `^exit` can therefore still be
+    /// drained before [`GdbProcess::wait_for_exit`] is called.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `-gdb-exit` cannot be sent or its result cannot be
+    /// received.
+    pub fn request_exit(&mut self) -> Result<GdbCommandResult, GdbProcessError> {
+        self.execute(commands::gdb_exit)
+    }
+
+    /// Waits for the GDB child process to terminate.
+    ///
+    /// This method does not send `-gdb-exit`; the caller must request shutdown
+    /// before calling it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if waiting for GDB fails.
+    pub fn wait_for_exit(&mut self) -> Result<ExitStatus, GdbProcessError> {
+        if self.terminated {
+            return self.child.wait().map_err(GdbProcessError::Wait);
+        }
+
         self.stdin.take();
+
         let status = self.child.wait().map_err(GdbProcessError::Wait)?;
         self.join_reader_thread();
         self.terminated = true;

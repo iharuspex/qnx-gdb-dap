@@ -7,10 +7,11 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 use crate::{
-    GdbBreakpoint, GdbDeployment, GdbDeploymentResult, GdbEvent, GdbExecutionEvent,
-    GdbExecutionPoll, GdbProcess, GdbProcessConfig, GdbProcessError, GdbRunStarted,
-    GdbSessionEvent, GdbSessionEventPoll, GdbStopReason, GdbStoppedFrame, MiAsyncRecord, MiRecord,
-    MiResult, MiResultRecord, SourceBreakpoint, commands, find_result,
+    GdbBreakpoint, GdbDeployment, GdbDeploymentResult, GdbDisconnectMode, GdbEvent,
+    GdbExecutionEvent, GdbExecutionPoll, GdbProcess, GdbProcessConfig, GdbProcessError,
+    GdbRunStarted, GdbSessionEvent, GdbSessionEventPoll, GdbShutdownResult, GdbStopReason,
+    GdbStoppedFrame, MiAsyncRecord, MiRecord, MiResult, MiResultRecord, SourceBreakpoint, commands,
+    find_result,
 };
 
 /// Configuration of a remote QNX debugging session.
@@ -600,7 +601,176 @@ impl GdbSession {
         &mut self.process
     }
 
-    /// Cleanly terminates GDB.
+    /// Disconnects from the inferior and closes GDB.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if detaching, terminating, or closing GDB fails.
+    pub fn disconnect(
+        &mut self,
+        mode: GdbDisconnectMode,
+    ) -> Result<GdbShutdownResult, GdbSessionError> {
+        if self.state == GdbSessionState::Terminated {
+            return Err(GdbSessionError::InvalidSessionState {
+                operation: "disconnect",
+                actual: self.state,
+                expected: vec![
+                    GdbSessionState::Deployed,
+                    GdbSessionState::Running,
+                    GdbSessionState::Stopped,
+                ],
+            });
+        }
+
+        let mut events = Vec::new();
+
+        match mode {
+            GdbDisconnectMode::Detach => {
+                events.extend(self.detach_inferior()?);
+            }
+
+            GdbDisconnectMode::Terminate => {
+                events.extend(self.terminate_inferior()?);
+            }
+        }
+
+        let exit_result = self.process.request_exit()?;
+
+        events.extend(
+            exit_result
+                .events
+                .into_iter()
+                .filter_map(convert_initial_gdb_event),
+        );
+
+        events.extend(self.drain_process_events()?);
+
+        let status = self.process.wait_for_exit()?;
+
+        // После завершения reader thread могли появиться последние записи.
+        events.extend(self.drain_process_events()?);
+
+        self.state = GdbSessionState::Terminated;
+
+        Ok(GdbShutdownResult { status, events })
+    }
+
+    fn detach_inferior(&mut self) -> Result<Vec<GdbSessionEvent>, GdbSessionError> {
+        if !matches!(
+            self.state,
+            GdbSessionState::Running | GdbSessionState::Stopped
+        ) {
+            return Ok(Vec::new());
+        }
+
+        let result = self.process.execute(commands::target_detach)?;
+
+        require_result_class("detach", &result.result, &["done"])?;
+
+        self.state = GdbSessionState::Deployed;
+
+        Ok(result
+            .events
+            .into_iter()
+            .filter_map(convert_initial_gdb_event)
+            .collect())
+    }
+
+    fn terminate_inferior(&mut self) -> Result<Vec<GdbSessionEvent>, GdbSessionError> {
+        if !matches!(
+            self.state,
+            GdbSessionState::Running | GdbSessionState::Stopped
+        ) {
+            return Ok(Vec::new());
+        }
+
+        let confirm_result = self.process.execute(commands::gdb_set_confirm_off)?;
+
+        require_result_class("gdb-set confirm off", &confirm_result.result, &["done"])?;
+
+        let kill_result = self.process.execute(commands::kill_inferior)?;
+
+        let kill_already_finished = is_inferior_not_running_result(&kill_result.result);
+
+        if !kill_already_finished {
+            require_result_class("kill", &kill_result.result, &["done"])?;
+        }
+
+        self.state = GdbSessionState::Deployed;
+
+        let mut events = confirm_result
+            .events
+            .into_iter()
+            .filter_map(convert_initial_gdb_event)
+            .collect::<Vec<_>>();
+
+        events.extend(
+            kill_result
+                .events
+                .into_iter()
+                .filter_map(convert_initial_gdb_event),
+        );
+
+        if kill_already_finished {
+            debug!("inferior finished before the QNX GDB kill command completed");
+        }
+
+        Ok(events)
+    }
+
+    fn drain_process_events(&mut self) -> Result<Vec<GdbSessionEvent>, GdbSessionError> {
+        let records = self.process.drain_records()?;
+        let mut events = Vec::new();
+
+        for record in records {
+            match record {
+                MiRecord::TargetStream(output) => {
+                    events.push(GdbSessionEvent::TargetOutput(output));
+                }
+
+                MiRecord::ConsoleStream(output) => {
+                    events.push(GdbSessionEvent::ConsoleOutput(output));
+                }
+
+                MiRecord::LogStream(output) => {
+                    events.push(GdbSessionEvent::DiagnosticOutput(output));
+                }
+
+                MiRecord::ExecAsync(record)
+                | MiRecord::StatusAsync(record)
+                | MiRecord::NotifyAsync(record) => {
+                    events.push(GdbSessionEvent::AsyncRecord {
+                        class: record.class,
+                    });
+                }
+
+                MiRecord::Result(result) => {
+                    let message = if result.class == "error" {
+                        find_result(&result.results, "msg")
+                            .and_then(crate::MiValue::as_const)
+                            .map(ToOwned::to_owned)
+                    } else {
+                        None
+                    };
+
+                    events.push(GdbSessionEvent::LateResult {
+                        token: result.token,
+                        class: result.class,
+                        message,
+                    });
+                }
+
+                MiRecord::Prompt | MiRecord::Empty => {}
+            }
+        }
+
+        Ok(events)
+    }
+
+    /// Closes GDB without an explicit inferior action.
+    ///
+    /// This method remains as a fallback for startup failures and EOF handling.
+    /// Normal DAP disconnect requests should use [`GdbSession::disconnect`].
     ///
     /// # Errors
     ///
@@ -698,6 +868,19 @@ fn validate_remote_program(remote_program: &str) -> Result<(), GdbSessionError> 
     }
 
     Ok(())
+}
+
+fn is_inferior_not_running_result(result: &MiResultRecord) -> bool {
+    if result.class != "error" {
+        return false;
+    }
+
+    let Some(message) = find_result(&result.results, "msg").and_then(crate::MiValue::as_const)
+    else {
+        return false;
+    };
+
+    message == "The program is not being run." || message.contains("program is not being run")
 }
 
 fn require_result_class(
@@ -996,7 +1179,8 @@ mod tests {
 
     use super::{
         GdbSessionConfig, GdbSessionError, GdbSessionEvent, convert_exec_async_record,
-        parse_breakpoint_result, require_result_class, validate_config, validate_remote_program,
+        is_inferior_not_running_result, parse_breakpoint_result, require_result_class,
+        validate_config, validate_remote_program,
     };
 
     #[test]
@@ -1266,6 +1450,34 @@ mod tests {
     #[test]
     fn accepts_remote_program_with_spaces() {
         validate_remote_program("/dev/shmem/my application").expect("spaces should be accepted");
+    }
+
+    #[test]
+    fn recognizes_inferior_already_finished_error() {
+        let result = MiResultRecord {
+            token: Some(8),
+            class: "error".to_owned(),
+            results: vec![MiResult::new(
+                "msg",
+                MiValue::Const("The program is not being run.".to_owned()),
+            )],
+        };
+
+        assert!(is_inferior_not_running_result(&result));
+    }
+
+    #[test]
+    fn does_not_ignore_other_kill_errors() {
+        let result = MiResultRecord {
+            token: Some(8),
+            class: "error".to_owned(),
+            results: vec![MiResult::new(
+                "msg",
+                MiValue::Const("Remote communication error.".to_owned()),
+            )],
+        };
+
+        assert!(!is_inferior_not_running_result(&result));
     }
 
     struct TemporaryFiles {

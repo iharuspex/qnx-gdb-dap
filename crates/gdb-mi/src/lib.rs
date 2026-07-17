@@ -19,6 +19,7 @@ mod parser;
 mod process;
 mod record;
 mod session;
+mod shutdown;
 mod value;
 
 pub use breakpoint::{GdbBreakpoint, SourceBreakpoint};
@@ -36,6 +37,7 @@ pub use record::{MiAsyncRecord, MiRecord, MiResultRecord};
 pub use session::{
     GdbSession, GdbSessionConfig, GdbSessionError, GdbSessionOutput, GdbSessionState,
 };
+pub use shutdown::{GdbDisconnectMode, GdbShutdownResult};
 pub use value::{MiListItem, MiResult, MiValue, find_result};
 
 #[cfg(test)]

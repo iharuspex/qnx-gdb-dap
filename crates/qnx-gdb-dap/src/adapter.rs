@@ -12,8 +12,9 @@ use crate::{
 use anyhow::Result;
 use qnx_dap::{DapReadError, DapReader, DapWriter, Event, OutgoingMessage, Request, Response};
 use qnx_gdb_mi::{
-    GdbDeployment, GdbEvent, GdbSession, GdbSessionConfig, GdbSessionEvent, GdbSessionEventPoll,
-    GdbSessionOutput, GdbStopReason, MiRecord, SourceBreakpoint,
+    GdbDeployment, GdbDisconnectMode, GdbEvent, GdbSession, GdbSessionConfig, GdbSessionEvent,
+    GdbSessionEventPoll, GdbSessionOutput, GdbShutdownResult, GdbStopReason, MiRecord,
+    SourceBreakpoint,
 };
 use serde_json::json;
 use tracing::{debug, info, warn};
@@ -780,6 +781,7 @@ impl DebugAdapter {
         let arguments = match request.arguments.clone() {
             Some(arguments) => match serde_json::from_value::<DisconnectArguments>(arguments) {
                 Ok(arguments) => arguments,
+
                 Err(error) => {
                     return self.send_error_response(
                         request,
@@ -788,6 +790,7 @@ impl DebugAdapter {
                     );
                 }
             },
+
             None => DisconnectArguments::default(),
         };
 
@@ -795,30 +798,95 @@ impl DebugAdapter {
             return self.send_error_response(request, writer, "suspendDebuggee is not supported");
         }
 
-        if arguments.terminate_debuggee {
-            debug!(
-                "terminateDebuggee was requested, but inferior termination \
-                 is not implemented yet"
-            );
-        }
+        let mode = if arguments.terminate_debuggee {
+            GdbDisconnectMode::Terminate
+        } else {
+            GdbDisconnectMode::Detach
+        };
 
-        if let Some(session) = self.session.as_mut() {
-            if let Err(error) = session.shutdown() {
-                return self.send_error_response(
+        let shutdown_result = self
+            .session
+            .as_mut()
+            .map(|session| session.disconnect(mode));
+
+        match shutdown_result {
+            Some(Ok(result)) => {
+                self.session = None;
+                self.state = AdapterState::Terminated;
+
+                self.send_success_response(request, writer, None)?;
+
+                self.forward_shutdown_events(writer, result)?;
+
+                let event = Event::new(self.sequence.next(), "terminated");
+
+                writer.write_message(&OutgoingMessage::Event(event))?;
+
+                Ok(())
+            }
+
+            Some(Err(error)) => {
+                warn!(
+                    %error,
+                    "failed to perform requested inferior disconnect action"
+                );
+
+                if let Some(session) = self.session.as_mut() {
+                    if let Err(shutdown_error) = session.shutdown() {
+                        warn!(
+                            %shutdown_error,
+                            "failed to close GDB after disconnect error"
+                        );
+                    }
+                }
+
+                self.session = None;
+                self.state = AdapterState::Terminated;
+
+                self.send_error_response(
                     request,
                     writer,
-                    format!("failed to shut down GDB session: {error}"),
-                );
+                    format!("failed to disconnect QNX debug session cleanly: {error}"),
+                )?;
+
+                let event = Event::new(self.sequence.next(), "terminated");
+
+                writer.write_message(&OutgoingMessage::Event(event))?;
+
+                Ok(())
+            }
+
+            None => {
+                self.state = AdapterState::Terminated;
+
+                self.send_success_response(request, writer, None)?;
+
+                let event = Event::new(self.sequence.next(), "terminated");
+
+                writer.write_message(&OutgoingMessage::Event(event))?;
+
+                Ok(())
             }
         }
+    }
 
-        self.session = None;
-        self.state = AdapterState::Terminated;
+    fn forward_shutdown_events<W>(
+        &mut self,
+        writer: &mut DapWriter<W>,
+        result: GdbShutdownResult,
+    ) -> Result<()>
+    where
+        W: Write,
+    {
+        debug!(
+            status = %result.status,
+            event_count = result.events.len(),
+            "GDB session closed"
+        );
 
-        self.send_success_response(request, writer, None)?;
-
-        let event = Event::new(self.sequence.next(), "terminated");
-        writer.write_message(&OutgoingMessage::Event(event))?;
+        for event in result.events {
+            self.send_gdb_session_event(writer, event)?;
+        }
 
         Ok(())
     }
